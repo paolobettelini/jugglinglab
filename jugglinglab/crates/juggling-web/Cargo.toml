@@ -1,0 +1,38 @@
+[package]
+name = "juggling-web"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+console_error_panic_hook.workspace = true
+js-sys.workspace = true
+juggling-core = { path = "../juggling-core" }
+leptos.workspace = true
+wasm-bindgen.workspace = true
+web-sys = { workspace = true, features = [
+    "Blob",
+    "BlobPropertyBag",
+    "CanvasGradient",
+    "CanvasRenderingContext2d",
+    "CanvasWindingRule",
+    "Document",
+    "DomRect",
+    "Element",
+    "Event",
+    "File",
+    "FileList",
+    "FileReader",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "HtmlImageElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "Storage",
+    "Url",
+    "WheelEvent",
+    "Window",
+] }

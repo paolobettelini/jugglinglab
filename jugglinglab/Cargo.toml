@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/juggling-core",
+    "crates/juggling-web",
+    "crates/juggling-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+axum = "0.8.9"
+console_error_panic_hook = "0.1.7"
+js-sys = "0.3.103"
+leptos = { version = "0.9.0-alpha", features = ["csr"] }
+roxmltree = "0.20.0"
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread"] }
+tower-http = { version = "0.6.11", features = ["fs"] }
+wasm-bindgen = "0.2.126"
+web-sys = "0.3.103"
