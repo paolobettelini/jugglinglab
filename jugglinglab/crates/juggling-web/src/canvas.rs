@@ -22,6 +22,34 @@ pub struct RenderSettings {
     pub paused: bool,
     pub show_trails: bool,
     pub show_grid: bool,
+    pub selected_position: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionEditHandle {
+    Xy,
+    Z,
+    Angle,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionEditorHit {
+    pub position_index: usize,
+    pub handle: PositionEditHandle,
+    pub center_x: f64,
+    pub center_y: f64,
+    pub local_x_dx: f64,
+    pub local_x_dy: f64,
+    pub local_y_dx: f64,
+    pub local_y_dy: f64,
+    pub z_dx: f64,
+    pub z_dy: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PositionEditorHitObject {
+    hit: PositionEditorHit,
+    shape: HitShape,
 }
 
 struct CanvasAnimator {
@@ -62,6 +90,7 @@ enum HitShape {
         y2: f64,
         radius: f64,
     },
+    Polygon(Vec<(f64, f64)>),
 }
 
 impl HitObject {
@@ -89,6 +118,7 @@ impl HitObject {
                 y2,
                 radius,
             } => point_segment_distance(x, y, x1, y1, x2, y2) <= radius,
+            HitShape::Polygon(ref points) => point_in_polygon(x, y, points),
         }
     }
 }
@@ -198,6 +228,7 @@ struct Rgba {
 thread_local! {
     static ANIMATOR: RefCell<Option<CanvasAnimator>> = const { RefCell::new(None) };
     static LAST_HITS: RefCell<Vec<HitObject>> = const { RefCell::new(Vec::new()) };
+    static LAST_POSITION_HITS: RefCell<Vec<PositionEditorHitObject>> = const { RefCell::new(Vec::new()) };
     static IMAGE_CACHE: RefCell<HashMap<String, HtmlImageElement>> = RefCell::new(HashMap::new());
     static PLAYBACK_CLOCK: RefCell<PlaybackClock> = RefCell::new(PlaybackClock {
         spec_key: None,
@@ -681,6 +712,27 @@ pub fn hit_test_by_id(canvas_id: &str, client_x: f64, client_y: f64) -> Option<S
     })
 }
 
+pub fn position_editor_hit_by_id(
+    canvas_id: &str,
+    client_x: f64,
+    client_y: f64,
+) -> Option<PositionEditorHit> {
+    let canvas = window()
+        .and_then(|win| win.document())
+        .and_then(|document| document.get_element_by_id(canvas_id))
+        .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())?;
+    let rect = canvas.get_bounding_client_rect();
+    let x = client_x - rect.left();
+    let y = client_y - rect.top();
+    LAST_POSITION_HITS.with(|hits| {
+        hits.borrow()
+            .iter()
+            .rev()
+            .find(|item| item.shape.contains(x, y))
+            .map(|item| item.hit.clone())
+    })
+}
+
 pub fn stop() {
     ANIMATOR.with(|slot| {
         if let Some(animator) = slot.borrow_mut().take() {
@@ -703,6 +755,7 @@ fn draw(
 
     let palette = Palette::for_theme(&settings.theme);
     LAST_HITS.with(|hits| hits.borrow_mut().clear());
+    LAST_POSITION_HITS.with(|hits| hits.borrow_mut().clear());
     ctx.set_fill_style_str(palette.background);
     ctx.fill_rect(0.0, 0.0, width, height);
 
@@ -796,7 +849,7 @@ fn draw_jml_layout_scene(
                 }
             }
             let prop = jml
-                .prop_for_path(path)
+                .prop_for_path_at_time(path, time)
                 .cloned()
                 .unwrap_or_else(|| PropSpec::default_for_type("ball"));
             objects.push(RenderObject::prop(point, path, prop, &camera));
@@ -810,6 +863,188 @@ fn draw_jml_layout_scene(
     for index in sorted_render_order(&mut objects) {
         draw_render_object(ctx, &objects[index], palette);
     }
+    if let Some(position_index) = settings.selected_position {
+        draw_position_editor(ctx, &camera, jml, position_index, palette);
+    }
+}
+
+fn draw_position_editor(
+    ctx: &CanvasRenderingContext2d,
+    camera: &RenderCamera,
+    jml: &JmlAnimation,
+    position_index: usize,
+    palette: &Palette,
+) {
+    const BOX_HALF_CM: f64 = 10.0;
+    const Z_HANDLE_CM: f64 = 20.0;
+    const ANGLE_HANDLE_CM: f64 = 20.0;
+    let Some(position) = jml.positions.get(position_index) else {
+        return;
+    };
+    let angle = position.angle.to_radians();
+    let center_world = Point3 {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+    };
+    let local_x = Point3 {
+        x: angle.cos(),
+        y: angle.sin(),
+        z: 0.0,
+    };
+    let local_y = Point3 {
+        x: -angle.sin(),
+        y: angle.cos(),
+        z: 0.0,
+    };
+    let world_z = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    let center = camera.project(center_world);
+    let axis_x = projected_axis(*camera, center_world, local_x);
+    let axis_y = projected_axis(*camera, center_world, local_y);
+    let axis_z = projected_axis(*camera, center_world, world_z);
+    let pitch_diff = angle_difference(camera.pitch - std::f64::consts::FRAC_PI_2);
+    let show_xy = pitch_diff > 20.0_f64.to_radians();
+    let show_angle = show_xy;
+    let show_z = pitch_diff < 60.0_f64.to_radians();
+    let geometry = PositionEditorHit {
+        position_index,
+        handle: PositionEditHandle::Xy,
+        center_x: center.x,
+        center_y: center.y,
+        local_x_dx: axis_x.0,
+        local_x_dy: axis_x.1,
+        local_y_dx: axis_y.0,
+        local_y_dy: axis_y.1,
+        z_dx: axis_z.0,
+        z_dy: axis_z.1,
+    };
+
+    ctx.set_stroke_style_str(palette.highlight);
+    ctx.set_fill_style_str(palette.highlight);
+    ctx.set_line_width(1.25);
+    ctx.begin_path();
+    ctx.arc(center.x, center.y, 3.0, 0.0, std::f64::consts::TAU)
+        .ok();
+    ctx.fill();
+
+    if show_xy {
+        let corners = [
+            screen_offset(center, axis_x, axis_y, -BOX_HALF_CM, -BOX_HALF_CM),
+            screen_offset(center, axis_x, axis_y, -BOX_HALF_CM, BOX_HALF_CM),
+            screen_offset(center, axis_x, axis_y, BOX_HALF_CM, BOX_HALF_CM),
+            screen_offset(center, axis_x, axis_y, BOX_HALF_CM, -BOX_HALF_CM),
+        ];
+        ctx.begin_path();
+        ctx.move_to(corners[0].0, corners[0].1);
+        for point in &corners[1..] {
+            ctx.line_to(point.0, point.1);
+        }
+        ctx.close_path();
+        ctx.stroke();
+        LAST_POSITION_HITS.with(|hits| {
+            hits.borrow_mut().push(PositionEditorHitObject {
+                hit: geometry.clone(),
+                shape: HitShape::Polygon(corners.to_vec()),
+            });
+        });
+    }
+
+    if show_z {
+        let z_end = (
+            center.x + axis_z.0 * Z_HANDLE_CM,
+            center.y + axis_z.1 * Z_HANDLE_CM,
+        );
+        ctx.begin_path();
+        ctx.move_to(center.x, center.y);
+        ctx.line_to(z_end.0, z_end.1);
+        ctx.stroke();
+        draw_editor_handle(ctx, z_end.0, z_end.1, 4.0);
+        let mut hit = geometry.clone();
+        hit.handle = PositionEditHandle::Z;
+        LAST_POSITION_HITS.with(|hits| {
+            hits.borrow_mut().push(PositionEditorHitObject {
+                hit,
+                shape: HitShape::Segment {
+                    x1: center.x,
+                    y1: center.y,
+                    x2: z_end.0,
+                    y2: z_end.1,
+                    radius: 6.0,
+                },
+            });
+        });
+    }
+
+    if show_angle {
+        let angle_end = (
+            center.x - axis_y.0 * ANGLE_HANDLE_CM,
+            center.y - axis_y.1 * ANGLE_HANDLE_CM,
+        );
+        ctx.begin_path();
+        ctx.move_to(center.x, center.y);
+        ctx.line_to(angle_end.0, angle_end.1);
+        ctx.stroke();
+        draw_editor_handle(ctx, angle_end.0, angle_end.1, 5.0);
+        let mut hit = geometry;
+        hit.handle = PositionEditHandle::Angle;
+        LAST_POSITION_HITS.with(|hits| {
+            hits.borrow_mut().push(PositionEditorHitObject {
+                hit,
+                shape: HitShape::Circle {
+                    x: angle_end.0,
+                    y: angle_end.1,
+                    radius: 8.0,
+                },
+            });
+        });
+    }
+}
+
+fn projected_axis(camera: RenderCamera, center: Point3, axis: Point3) -> (f64, f64) {
+    let projected_center = camera.project(center);
+    let projected_axis = camera.project(Point3 {
+        x: center.x + axis.x,
+        y: center.y + axis.y,
+        z: center.z + axis.z,
+    });
+    (
+        projected_axis.x - projected_center.x,
+        projected_axis.y - projected_center.y,
+    )
+}
+
+fn screen_offset(
+    center: ScreenPoint,
+    axis_x: (f64, f64),
+    axis_y: (f64, f64),
+    x: f64,
+    y: f64,
+) -> (f64, f64) {
+    (
+        center.x + axis_x.0 * x + axis_y.0 * y,
+        center.y + axis_x.1 * x + axis_y.1 * y,
+    )
+}
+
+fn draw_editor_handle(ctx: &CanvasRenderingContext2d, x: f64, y: f64, radius: f64) {
+    ctx.begin_path();
+    ctx.arc(x, y, radius, 0.0, std::f64::consts::TAU)
+        .ok();
+    ctx.fill();
+}
+
+fn angle_difference(mut angle: f64) -> f64 {
+    while angle > std::f64::consts::PI {
+        angle -= std::f64::consts::TAU;
+    }
+    while angle <= -std::f64::consts::PI {
+        angle += std::f64::consts::TAU;
+    }
+    angle.abs()
 }
 
 fn push_juggler_render_objects(
@@ -1748,6 +1983,25 @@ fn point_segment_distance(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) 
     let closest_x = x1 + t * dx;
     let closest_y = y1 + t * dy;
     screen_distance(px, py, closest_x, closest_y)
+}
+
+fn point_in_polygon(x: f64, y: f64, points: &[(f64, f64)]) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = points.len() - 1;
+    for current in 0..points.len() {
+        let (xi, yi) = points[current];
+        let (xj, yj) = points[previous];
+        if ((yi > y) != (yj > y))
+            && x < (xj - xi) * (y - yi) / (yj - yi) + xi
+        {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
 }
 
 fn plane_depth_at(object: &RenderObject, x: f64, y: f64) -> Option<f64> {

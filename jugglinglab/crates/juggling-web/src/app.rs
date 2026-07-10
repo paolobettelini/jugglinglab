@@ -6,8 +6,9 @@ use juggling_core::ladder::{
     LadderTransition, build_ladder_diagram,
 };
 use juggling_core::mhn_body::BodyPosition;
-use juggling_core::mhn_jml::{MhnJmlEvent, MhnJmlPattern, MhnJmlTransitionType};
+use juggling_core::mhn_jml::{MhnJmlEvent, MhnJmlPattern, MhnJmlProp, MhnJmlTransitionType};
 use juggling_core::mhn_matrix::MhnMatrix;
+use juggling_core::prop::PropSpec;
 use juggling_core::{library, siteswap};
 use leptos::ev;
 use leptos::prelude::*;
@@ -23,17 +24,48 @@ const LADDER_TOP_Y: f64 = 8.0;
 const LADDER_HEIGHT: f64 = 86.0;
 const PATTERN_SOURCE_BASE: &str = "base";
 const PATTERN_SOURCE_JML: &str = "jml";
+const HISTORY_LIMIT: usize = 64;
+
+#[derive(Clone, Debug, PartialEq)]
+struct EditorSnapshot {
+    records: Vec<PatternRecord>,
+    selected: usize,
+    pattern_source: String,
+    pattern_text: String,
+    draft: String,
+    selected_ladder: String,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct LadderDrag {
     kind: LadderDragKind,
+    pointer_id: i32,
+    selected_id: String,
+    start_time: f64,
     preview_time: f64,
+    was_selected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct LadderInsertTarget {
     juggler: usize,
     time: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LadderContextMenu {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PositionCanvasDrag {
+    hit: canvas::PositionEditorHit,
+    start_client_x: f64,
+    start_client_y: f64,
+    start_position: BodyPosition,
+    original_record: PatternRecord,
+    checkpointed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,11 +77,27 @@ struct DefineThrowDraft {
     throw_mod: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+struct DefinePropDraft {
+    path: usize,
+    selected_id: String,
+    prop_assignment: Vec<usize>,
+    playback_time: f64,
+    prop_type: String,
+    prop_mod: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum LadderDragKind {
-    Event(usize),
+    Event {
+        primary_index: usize,
+        primary_time: f64,
+    },
     Position(usize),
-    Tracker { was_playing: bool },
+    Tracker {
+        was_playing: bool,
+        prop_cycle: i64,
+    },
 }
 
 #[component]
@@ -87,8 +135,15 @@ pub fn App() -> impl IntoView {
     let (selected_ladder, set_selected_ladder) = signal(String::new());
     let (ladder_drag, set_ladder_drag) = signal(None::<LadderDrag>);
     let (ladder_insert_target, set_ladder_insert_target) = signal(None::<LadderInsertTarget>);
+    let (ladder_context_menu, set_ladder_context_menu) = signal(None::<LadderContextMenu>);
+    let (ladder_popup_was_playing, set_ladder_popup_was_playing) = signal(None::<bool>);
+    let (ladder_prop_edit_time, set_ladder_prop_edit_time) = signal(0.0);
     let (define_throw_dialog, set_define_throw_dialog) = signal(None::<DefineThrowDraft>);
+    let (define_prop_dialog, set_define_prop_dialog) = signal(None::<DefinePropDraft>);
+    let (undo_stack, set_undo_stack) = signal(Vec::<EditorSnapshot>::new());
+    let (redo_stack, set_redo_stack) = signal(Vec::<EditorSnapshot>::new());
     let (view_drag_start, set_view_drag_start) = signal(None::<(f64, f64)>);
+    let (position_canvas_drag, set_position_canvas_drag) = signal(None::<PositionCanvasDrag>);
     let (view_dragged, set_view_dragged) = signal(false);
     let (pressed_camera_keys, set_pressed_camera_keys) = signal(Vec::<String>::new());
     let (status, set_status) = signal("Ready".to_string());
@@ -137,9 +192,39 @@ pub fn App() -> impl IntoView {
             paused: !playing.get() || view_drag_start.get().is_some(),
             show_trails: show_trails.get(),
             show_grid: show_grid.get(),
+            selected_position: selected_ladder_position_index(
+                &current_spec.get(),
+                &selected_ladder.get(),
+            ),
         };
         canvas::start_by_id("juggling-stage", current_spec.get(), settings);
     });
+
+    let seek_renderer = move |time: f64| {
+        let spec = current_spec.get_untracked();
+        canvas::set_playback_time(&spec, time);
+        canvas::start_by_id(
+            "juggling-stage",
+            spec,
+            RenderSettings {
+                theme: theme.get_untracked(),
+                speed: speed.get_untracked(),
+                zoom: zoom.get_untracked(),
+                camera_yaw: camera_yaw.get_untracked(),
+                camera_pitch: camera_pitch.get_untracked(),
+                camera_pan_x: camera_pan_x.get_untracked(),
+                camera_pan_y: camera_pan_y.get_untracked(),
+                camera_pan_z: camera_pan_z.get_untracked(),
+                paused: true,
+                show_trails: show_trails.get_untracked(),
+                show_grid: show_grid.get_untracked(),
+                selected_position: selected_ladder_position_index(
+                    &current_spec.get_untracked(),
+                    &selected_ladder.get_untracked(),
+                ),
+            },
+        );
+    };
 
     Effect::new(move |_| {
         if let Some(record) = current_record.get() {
@@ -220,9 +305,125 @@ pub fn App() -> impl IntoView {
         tick.forget();
     }
 
+    let checkpoint_editor = move || {
+        push_editor_history(
+            records,
+            selected,
+            pattern_source,
+            pattern_text,
+            draft,
+            selected_ladder,
+            set_undo_stack,
+            set_redo_stack,
+        );
+    };
+
+    let commit_ladder_record = move |edited: PatternRecord| {
+        checkpoint_editor();
+        replace_current_ladder_record(
+            edited,
+            selected,
+            set_selected,
+            set_records,
+            set_pattern_source,
+            set_pattern_text,
+            set_draft,
+        );
+    };
+
+    let perform_undo = move || {
+        let mut previous = None;
+        set_undo_stack.update(|stack| {
+            previous = stack.pop();
+        });
+        let Some(snapshot) = previous else {
+            set_status.set("Nothing to undo".to_string());
+            return;
+        };
+        push_redo_snapshot(
+            records,
+            selected,
+            pattern_source,
+            pattern_text,
+            draft,
+            selected_ladder,
+            set_redo_stack,
+        );
+        restore_editor_snapshot(
+            snapshot,
+            set_records,
+            set_selected,
+            set_pattern_source,
+            set_pattern_text,
+            set_draft,
+            set_selected_ladder,
+        );
+        set_status.set("Undo".to_string());
+    };
+
+    let undo_edit = move |_| perform_undo();
+
+    let perform_redo = move || {
+        let mut next = None;
+        set_redo_stack.update(|stack| {
+            next = stack.pop();
+        });
+        let Some(snapshot) = next else {
+            set_status.set("Nothing to redo".to_string());
+            return;
+        };
+        push_undo_snapshot(
+            records,
+            selected,
+            pattern_source,
+            pattern_text,
+            draft,
+            selected_ladder,
+            set_undo_stack,
+        );
+        restore_editor_snapshot(
+            snapshot,
+            set_records,
+            set_selected,
+            set_pattern_source,
+            set_pattern_text,
+            set_draft,
+            set_selected_ladder,
+        );
+        set_status.set("Redo".to_string());
+    };
+
+    let redo_edit = move |_| perform_redo();
+
+    {
+        let keydown = Closure::wrap(Box::new(move |event: ev::KeyboardEvent| {
+            if !(event.ctrl_key() || event.meta_key()) || editor_shortcut_target_is_editable(&event)
+            {
+                return;
+            }
+            let key = event.key().to_ascii_lowercase();
+            if key == "z" && event.shift_key() || key == "y" {
+                event.prevent_default();
+                perform_redo();
+            } else if key == "z" {
+                event.prevent_default();
+                perform_undo();
+            }
+        }) as Box<dyn FnMut(ev::KeyboardEvent)>);
+        if let Some(window) = window() {
+            window
+                .add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref())
+                .ok();
+        }
+        keydown.forget();
+    }
+
     let import_jml = move |xml: String| match jml::parse_jml(&xml) {
         Ok(library) => {
             let added = library.records.len();
+            if added > 0 {
+                checkpoint_editor();
+            }
             set_records.update(|records| {
                 let insert_at = records.len();
                 records.extend(library.records);
@@ -240,6 +441,7 @@ pub fn App() -> impl IntoView {
         let config = draft.get_untracked();
         match record_from_config_or_current_jml(&config, current_record.get_untracked()) {
             Ok((record, message)) => {
+                checkpoint_editor();
                 set_records.update(|records| {
                     records.push(record);
                     set_selected.set(records.len() - 1);
@@ -336,6 +538,7 @@ pub fn App() -> impl IntoView {
                     if let Some(record) =
                         library.records.into_iter().find(PatternRecord::is_playable)
                     {
+                        checkpoint_editor();
                         set_records.update(|records| {
                             records.push(record);
                             set_selected.set(records.len() - 1);
@@ -352,6 +555,7 @@ pub fn App() -> impl IntoView {
             let config = text;
             match record_from_config_or_current_jml(&config, current_record.get_untracked()) {
                 Ok((record, message)) => {
+                    checkpoint_editor();
                     set_records.update(|records| {
                         records.push(record);
                         set_selected.set(records.len() - 1);
@@ -497,24 +701,32 @@ pub fn App() -> impl IntoView {
 
     let clear_camera_move = move |_| set_pressed_camera_keys.set(Vec::new());
 
-    let preview_ladder_drag = move |event: ev::MouseEvent| {
+    let preview_ladder_drag = move |event: ev::PointerEvent| {
         let Some(drag) = ladder_drag.get_untracked() else {
             return;
         };
+        if drag.pointer_id != event.pointer_id() {
+            return;
+        }
         event.prevent_default();
         let Some(diagram) = ladder_diagram(&current_spec.get_untracked()) else {
             return;
         };
-        if let Some(time) = ladder_time_from_mouse(&event, &diagram) {
+        if let Some(time) = ladder_time_from_client_y(event.client_y(), &diagram) {
             let time = constrain_ladder_drag_time(&diagram, &drag, time);
             set_ladder_drag.set(Some(LadderDrag {
                 kind: drag.kind.clone(),
+                pointer_id: drag.pointer_id,
+                selected_id: drag.selected_id.clone(),
+                start_time: drag.start_time,
                 preview_time: time,
+                was_selected: drag.was_selected,
             }));
-            if matches!(drag.kind, LadderDragKind::Tracker { .. }) {
-                canvas::set_playback_time(&current_spec.get_untracked(), time);
-                set_playhead_time.set(time);
-                if let Some(juggler) = ladder_juggler_from_mouse(&event, &diagram) {
+            if let LadderDragKind::Tracker { prop_cycle, .. } = drag.kind {
+                let absolute_time = ladder_time_in_cycle(&diagram, prop_cycle, time);
+                seek_renderer(absolute_time);
+                set_playhead_time.set(absolute_time);
+                if let Some(juggler) = ladder_juggler_from_client_x(event.client_x(), &diagram) {
                     set_ladder_insert_target.set(Some(LadderInsertTarget { juggler, time }));
                 }
                 set_status.set(format!("Move tracker to {time:.3}s"));
@@ -524,25 +736,34 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    let finish_ladder_drag = move |event: ev::MouseEvent| {
+    let finish_ladder_drag = move |event: ev::PointerEvent| {
         let Some(drag) = ladder_drag.get_untracked() else {
             return;
         };
+        if drag.pointer_id != event.pointer_id() {
+            return;
+        }
         event.prevent_default();
+        release_ladder_pointer(drag.pointer_id);
         set_ladder_drag.set(None);
 
         let Some(diagram) = ladder_diagram(&current_spec.get_untracked()) else {
             set_status.set("No ladder data available for this pattern".to_string());
             return;
         };
-        let time = if let Some(raw_time) = ladder_time_from_mouse(&event, &diagram) {
+        let time = if let Some(raw_time) = ladder_time_from_client_y(event.client_y(), &diagram) {
             constrain_ladder_drag_time(&diagram, &drag, raw_time)
         } else {
             drag.preview_time
         };
-        if let LadderDragKind::Tracker { was_playing } = drag.kind {
-            canvas::set_playback_time(&current_spec.get_untracked(), time);
-            set_playhead_time.set(time);
+        if let LadderDragKind::Tracker {
+            was_playing,
+            prop_cycle,
+        } = drag.kind
+        {
+            let absolute_time = ladder_time_in_cycle(&diagram, prop_cycle, time);
+            seek_renderer(absolute_time);
+            set_playhead_time.set(absolute_time);
             set_playing.set(was_playing);
             set_status.set(format!("Tracker moved to {time:.3}s"));
             return;
@@ -553,9 +774,24 @@ pub fn App() -> impl IntoView {
             return;
         };
 
+        if (time - drag.start_time).abs() < 1e-9 {
+            if drag.was_selected {
+                set_selected_ladder.set(String::new());
+                set_status.set("Ladder selection cleared".to_string());
+            } else {
+                set_status.set("Ladder item selected".to_string());
+            }
+            return;
+        }
+
+        let selected_id = drag.selected_id.clone();
         let edit_result = match drag.kind {
-            LadderDragKind::Event(event_index) => {
-                move_ladder_event_in_record(&record, event_index, time)
+            LadderDragKind::Event {
+                primary_index,
+                primary_time,
+            } => {
+                let new_primary_time = primary_time + time - drag.start_time;
+                move_ladder_event_in_record(&record, primary_index, new_primary_time)
             }
             LadderDragKind::Position(position_index) => {
                 move_ladder_position_in_record(&record, position_index, time)
@@ -565,27 +801,23 @@ pub fn App() -> impl IntoView {
 
         match edit_result {
             Ok(edited) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
-                set_selected_ladder.set(String::new());
+                commit_ladder_record(edited);
+                set_selected_ladder.set(selected_id);
                 set_status.set(format!("Moved ladder item to {time:.3}s"));
             }
             Err(err) => set_status.set(err),
         }
     };
 
-    let cancel_ladder_drag = move |event: ev::MouseEvent| {
-        if ladder_drag.get_untracked().is_some() {
+    let cancel_ladder_drag = move |event: ev::PointerEvent| {
+        if let Some(drag) = ladder_drag.get_untracked() {
+            if drag.pointer_id != event.pointer_id() {
+                return;
+            }
             event.prevent_default();
+            release_ladder_pointer(drag.pointer_id);
             if let Some(LadderDrag {
-                kind: LadderDragKind::Tracker { was_playing },
+                kind: LadderDragKind::Tracker { was_playing, .. },
                 ..
             }) = ladder_drag.get_untracked()
             {
@@ -596,28 +828,86 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    let start_ladder_tracker_drag = move |event: ev::MouseEvent| {
+    let start_ladder_tracker_drag = move |event: ev::PointerEvent| {
+        if event.button() != 0 {
+            return;
+        }
         event.prevent_default();
         event.stop_propagation();
         let Some(diagram) = ladder_diagram(&current_spec.get_untracked()) else {
             set_status.set("No ladder data available for this pattern".to_string());
             return;
         };
-        let Some(time) = ladder_time_from_mouse(&event, &diagram) else {
+        let Some(time) = ladder_time_from_client_y(event.client_y(), &diagram) else {
             return;
         };
-        let juggler = ladder_juggler_from_mouse(&event, &diagram).unwrap_or(1);
+        let juggler = ladder_juggler_from_client_x(event.client_x(), &diagram).unwrap_or(1);
         let was_playing = playing.get_untracked();
+        let prop_cycle = ladder_playback_cycle(
+            &diagram,
+            canvas::playback_time(&current_spec.get_untracked()),
+        );
+        capture_ladder_pointer(event.pointer_id());
         set_playing.set(false);
-        canvas::set_playback_time(&current_spec.get_untracked(), time);
-        set_playhead_time.set(time);
+        let absolute_time = ladder_time_in_cycle(&diagram, prop_cycle, time);
+        seek_renderer(absolute_time);
+        set_playhead_time.set(absolute_time);
         set_ladder_insert_target.set(Some(LadderInsertTarget { juggler, time }));
         set_ladder_drag.set(Some(LadderDrag {
-            kind: LadderDragKind::Tracker { was_playing },
+            kind: LadderDragKind::Tracker {
+                was_playing,
+                prop_cycle,
+            },
+            pointer_id: event.pointer_id(),
+            selected_id: String::new(),
+            start_time: time,
             preview_time: time,
+            was_selected: false,
         }));
         set_selected_ladder.set(String::new());
         set_status.set(format!("Move tracker to {time:.3}s"));
+    };
+
+    let finish_ladder_popup = move || {
+        set_ladder_context_menu.set(None);
+        let mut was_playing = None;
+        set_ladder_popup_was_playing.update(|saved| was_playing = saved.take());
+        if let Some(was_playing) = was_playing {
+            set_playing.set(was_playing);
+        }
+    };
+
+    let open_ladder_context = move |event: ev::MouseEvent, selected_id: String| {
+        event.prevent_default();
+        event.stop_propagation();
+        let Some(diagram) = ladder_diagram(&current_spec.get_untracked()) else {
+            set_status.set("No ladder data available for this pattern".to_string());
+            return;
+        };
+        set_selected_ladder.set(selected_id.clone());
+        if !selected_ladder_has_context_actions(&current_spec.get_untracked(), &selected_id) {
+            set_ladder_context_menu.set(None);
+            set_status.set("No actions available for this ladder item".to_string());
+            return;
+        }
+        if ladder_popup_was_playing.get_untracked().is_none() {
+            set_ladder_popup_was_playing.set(Some(playing.get_untracked()));
+        }
+        set_ladder_prop_edit_time.set(canvas::playback_time(&current_spec.get_untracked()));
+        set_playing.set(false);
+        if let (Some(time), Some(juggler)) = (
+            ladder_time_from_mouse(&event, &diagram),
+            ladder_juggler_from_mouse(&event, &diagram),
+        ) {
+            set_ladder_insert_target.set(Some(LadderInsertTarget { juggler, time }));
+            let prop_cycle = ladder_playback_cycle(&diagram, ladder_prop_edit_time.get_untracked());
+            let absolute_time = ladder_time_in_cycle(&diagram, prop_cycle, time);
+            seek_renderer(absolute_time);
+            set_playhead_time.set(absolute_time);
+        }
+        let (x, y) = ladder_context_position(event.client_x() as f64, event.client_y() as f64);
+        set_ladder_context_menu.set(Some(LadderContextMenu { x, y }));
+        set_status.set("Ladder actions".to_string());
     };
 
     let add_ladder_position_from_target = move |_| {
@@ -636,15 +926,7 @@ pub fn App() -> impl IntoView {
 
         match add_ladder_position_in_record(&record, &spec, target.juggler, target.time) {
             Ok((edited, position_index)) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
+                commit_ladder_record(edited);
                 set_selected_ladder.set(format!("position-{}", position_index + 1));
                 set_status.set(format!(
                     "Added position for juggler {} at {:.3}s",
@@ -671,15 +953,7 @@ pub fn App() -> impl IntoView {
 
         match add_ladder_event_in_record(&record, &spec, target.juggler, hand, target.time) {
             Ok((edited, event_index)) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
+                commit_ladder_record(edited);
                 set_selected_ladder.set(format!("event-{}", event_index + 1));
                 set_status.set(format!(
                     "Added {} event for juggler {} at {:.3}s",
@@ -720,18 +994,61 @@ pub fn App() -> impl IntoView {
             dialog.throw_mod.as_deref(),
         ) {
             Ok(edited) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
+                commit_ladder_record(edited);
                 set_selected_ladder.set(dialog.selected_id);
                 set_define_throw_dialog.set(None);
+                finish_ladder_popup();
                 set_status.set("Throw definition changed".to_string());
+            }
+            Err(err) => set_status.set(err),
+        }
+    };
+
+    let open_define_prop_dialog = move |_| {
+        let selected_id = selected_ladder.get_untracked();
+        let Some(record) = current_record.get_untracked() else {
+            set_status.set("No current pattern selected".to_string());
+            return;
+        };
+        match selected_ladder_prop_draft(
+            &record,
+            &current_spec.get_untracked(),
+            &selected_id,
+            ladder_prop_edit_time.get_untracked(),
+        ) {
+            Ok(Some(draft)) => {
+                set_define_prop_dialog.set(Some(draft));
+                set_status.set("Editing prop definition".to_string());
+            }
+            Ok(None) => set_status.set("Select a path or transition first".to_string()),
+            Err(err) => set_status.set(err),
+        }
+    };
+
+    let confirm_define_prop_dialog = move |_| {
+        let Some(dialog) = define_prop_dialog.get_untracked() else {
+            return;
+        };
+        let Some(record) = current_record.get_untracked() else {
+            set_status.set("No current pattern selected".to_string());
+            return;
+        };
+
+        match define_ladder_prop_in_record(
+            &record,
+            dialog.path,
+            &dialog.prop_assignment,
+            &dialog.prop_type,
+            dialog.prop_mod.as_deref(),
+        ) {
+            Ok(edited) => {
+                commit_ladder_record(edited);
+                set_selected_ladder.set(dialog.selected_id);
+                set_define_prop_dialog.set(None);
+                seek_renderer(dialog.playback_time);
+                set_playhead_time.set(dialog.playback_time);
+                finish_ladder_popup();
+                set_status.set("Prop definition changed".to_string());
             }
             Err(err) => set_status.set(err),
         }
@@ -768,15 +1085,7 @@ pub fn App() -> impl IntoView {
 
         match result {
             Ok(edited) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
+                commit_ladder_record(edited);
                 set_selected_ladder.set(String::new());
                 set_status.set("Ladder item removed".to_string());
             }
@@ -804,15 +1113,7 @@ pub fn App() -> impl IntoView {
             target,
         ) {
             Ok(edited) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
+                commit_ladder_record(edited);
                 set_selected_ladder.set(String::new());
                 set_status.set("Catch style changed".to_string());
             }
@@ -839,15 +1140,7 @@ pub fn App() -> impl IntoView {
             transition.transition_index,
         ) {
             Ok(edited) => {
-                replace_current_ladder_record(
-                    edited,
-                    selected,
-                    set_selected,
-                    set_records,
-                    set_pattern_source,
-                    set_pattern_text,
-                    set_draft,
-                );
+                commit_ladder_record(edited);
                 set_selected_ladder.set(String::new());
                 set_status.set("Transition moved to end of event".to_string());
             }
@@ -865,6 +1158,20 @@ pub fn App() -> impl IntoView {
                     </label>
                     <button type="button" on:click=export_current>"Save Pattern"</button>
                     <button type="button" on:click=export_all>"Save List"</button>
+                    <button
+                        type="button"
+                        prop:disabled=move || undo_stack.with(Vec::is_empty)
+                        on:click=undo_edit
+                    >
+                        "Undo"
+                    </button>
+                    <button
+                        type="button"
+                        prop:disabled=move || redo_stack.with(Vec::is_empty)
+                        on:click=redo_edit
+                    >
+                        "Redo"
+                    </button>
                 </div>
                 <div class="menu-group">
                     <span class="toolbar-label">"Notation"</span>
@@ -1096,43 +1403,74 @@ pub fn App() -> impl IntoView {
                                 viewBox="0 0 100 100"
                                 preserveAspectRatio="none"
                                 class=move || if ladder_drag.get().is_some() { "ladder-svg dragging" } else { "ladder-svg" }
-                                on:mousemove=preview_ladder_drag
-                                on:mouseup=finish_ladder_drag
-                                on:mouseleave=cancel_ladder_drag
+                                on:pointermove=preview_ladder_drag
+                                on:pointerup=finish_ladder_drag
+                                on:pointercancel=cancel_ladder_drag
                             >
+                                <defs>
+                                    <clipPath id="ladder-period-clip">
+                                        <rect x="0" y=LADDER_TOP_Y width="100" height=LADDER_HEIGHT />
+                                    </clipPath>
+                                </defs>
                                 <rect
                                     x="0"
                                     y="5"
                                     width="100"
                                     height="90"
                                     class="ladder-hotzone"
-                                    on:mousedown=start_ladder_tracker_drag
+                                    on:pointerdown=start_ladder_tracker_drag
+                                    on:contextmenu=move |event| open_ladder_context(event, String::new())
                                 />
                                 {move || ladder_track_views(&current_spec.get())}
                                 {move || {
-                                    let Some(diagram) = ladder_diagram(&current_spec.get()) else {
+                                    let spec = current_spec.get();
+                                    let Some(diagram) = ladder_diagram(&spec) else {
                                         return Vec::new();
                                     };
+                                    let drag = ladder_drag.get();
                                     diagram
                                         .edges
                                         .iter()
                                         .map(|edge| {
                                             let edge_id = edge.id.clone();
+                                            let context_edge_id = edge.id.clone();
                                             let status_label = ladder_edge_label(edge);
                                             let selected = selected_ladder.get() == edge_id;
-                                            let shapes = ladder_edge_shapes(&diagram, edge);
+                                            let shapes = ladder_edge_shapes(&diagram, edge, drag.as_ref());
                                             let start_x = ladder_endpoint_x(&diagram, &edge.start);
-                                            let start_y = ladder_time_y(&diagram, edge.start.time);
+                                            let start_y = ladder_absolute_time_y(
+                                                &diagram,
+                                                ladder_endpoint_preview_time(&edge.start, drag.as_ref()),
+                                            );
                                             let end_x = ladder_endpoint_x(&diagram, &edge.end);
-                                            let end_y = ladder_time_y(&diagram, edge.end.time);
+                                            let end_y = ladder_absolute_time_y(
+                                                &diagram,
+                                                ladder_endpoint_preview_time(&edge.end, drag.as_ref()),
+                                            );
+                                            let prop_style = ladder_prop_style(
+                                                &spec,
+                                                edge.path,
+                                                playhead_time.get(),
+                                            );
                                             view! {
                                                 <g
                                                     class=if selected { "ladder-item selected" } else { "ladder-item" }
+                                                    style=prop_style
+                                                    clip-path="url(#ladder-period-clip)"
                                                     on:click=move |_| {
                                                         set_selected_ladder.set(edge_id.clone());
                                                         set_status.set(format!("Selected timing: {status_label}"));
                                                     }
+                                                    on:contextmenu=move |event| {
+                                                        open_ladder_context(event, context_edge_id.clone());
+                                                    }
                                                 >
+                                                    {shapes
+                                                        .iter()
+                                                        .cloned()
+                                                        .map(ladder_edge_hit_shape_view)
+                                                        .collect::<Vec<_>>()
+                                                    }
                                                     {shapes
                                                         .into_iter()
                                                         .map(ladder_edge_shape_view)
@@ -1146,7 +1484,8 @@ pub fn App() -> impl IntoView {
                                         .collect::<Vec<_>>()
                                 }}
                                 {move || {
-                                    let Some(diagram) = ladder_diagram(&current_spec.get()) else {
+                                    let spec = current_spec.get();
+                                    let Some(diagram) = ladder_diagram(&spec) else {
                                         return Vec::new();
                                     };
                                     diagram
@@ -1155,23 +1494,40 @@ pub fn App() -> impl IntoView {
                                         .into_iter()
                                         .map(|transition| {
                                             let transition_id = transition.id.clone();
+                                            let context_transition_id = transition.id.clone();
                                             let status_label = ladder_transition_label(&transition);
                                             let selected = selected_ladder.get() == transition_id;
                                             let x = ladder_transition_x(&diagram, &transition);
-                                            let y = ladder_time_y(&diagram, transition.time);
+                                            let y = ladder_time_y(
+                                                &diagram,
+                                                ladder_transition_preview_time(
+                                                    &transition,
+                                                    ladder_drag.get().as_ref(),
+                                                ),
+                                            );
                                             let class_name = if selected {
                                                 format!("ladder-transition selected {}", ladder_transition_class(&transition))
                                             } else {
                                                 format!("ladder-transition {}", ladder_transition_class(&transition))
                                             };
+                                            let prop_style = ladder_prop_style(
+                                                &spec,
+                                                transition.path,
+                                                playhead_time.get(),
+                                            );
                                             view! {
                                                 <g
                                                     class=class_name
+                                                    style=prop_style
                                                     on:click=move |_| {
                                                         set_selected_ladder.set(transition_id.clone());
                                                         set_status.set(format!("Selected transition: {status_label}"));
                                                     }
+                                                    on:contextmenu=move |event| {
+                                                        open_ladder_context(event, context_transition_id.clone());
+                                                    }
                                                 >
+                                                    <circle class="ladder-node-hitbox" cx=x cy=y r="3.2" />
                                                     <circle cx=x cy=y r="2.15" />
                                                 </g>
                                             }
@@ -1203,28 +1559,42 @@ pub fn App() -> impl IntoView {
                                             let side = 4.6;
                                             let top_left_x = x - side / 2.0;
                                             let top_left_y = y - side / 2.0;
-                                            let click_position_id = position_id.clone();
-                                            let click_status_label = status_label.clone();
                                             let drag_position_id = position_id.clone();
+                                            let context_position_id = position_id.clone();
                                             let drag_status_label = status_label.clone();
                                             view! {
                                                 <g
                                                     class=if selected { "ladder-position selected" } else { "ladder-position" }
-                                                    on:click=move |_| {
-                                                        set_selected_ladder.set(click_position_id.clone());
-                                                        set_status.set(format!("Selected position: {click_status_label}"));
-                                                    }
-                                                    on:mousedown=move |mouse_event: ev::MouseEvent| {
-                                                        mouse_event.prevent_default();
-                                                        mouse_event.stop_propagation();
+                                                    on:pointerdown=move |pointer_event: ev::PointerEvent| {
+                                                        if pointer_event.button() != 0 {
+                                                            return;
+                                                        }
+                                                        pointer_event.prevent_default();
+                                                        pointer_event.stop_propagation();
+                                                        capture_ladder_pointer(pointer_event.pointer_id());
+                                                        let was_selected = selected_ladder.get_untracked() == drag_position_id;
                                                         set_selected_ladder.set(drag_position_id.clone());
                                                         set_ladder_drag.set(Some(LadderDrag {
                                                             kind: LadderDragKind::Position(position_index),
+                                                            pointer_id: pointer_event.pointer_id(),
+                                                            selected_id: drag_position_id.clone(),
+                                                            start_time: position.time,
                                                             preview_time: position.time,
+                                                            was_selected,
                                                         }));
                                                         set_status.set(format!("Dragging position: {drag_status_label}"));
                                                     }
+                                                    on:contextmenu=move |event| {
+                                                        open_ladder_context(event, context_position_id.clone());
+                                                    }
                                                 >
+                                                    <rect
+                                                        class="ladder-node-hitbox"
+                                                        x=x - 3.4
+                                                        y=y - 3.4
+                                                        width="6.8"
+                                                        height="6.8"
+                                                    />
                                                     <rect x=top_left_x y=top_left_y width=side height=side />
                                                 </g>
                                             }
@@ -1244,41 +1614,62 @@ pub fn App() -> impl IntoView {
                                             let status_label = ladder_event_label(&event);
                                             let selected = selected_ladder.get() == event_id;
                                             let event_index = event.event_index;
+                                            let symmetry_linked = ladder_drag.get().is_some_and(|drag| {
+                                                matches!(
+                                                    drag.kind,
+                                                    LadderDragKind::Event { primary_index, .. }
+                                                        if primary_index == event_index
+                                                ) && drag.selected_id != event_id
+                                            });
                                             let x = ladder_track_x(&diagram, event.track_index);
-                                            let preview_time = ladder_drag
-                                                .get()
-                                                .filter(|drag| {
-                                                    drag.kind == LadderDragKind::Event(event_index)
-                                                })
-                                                .map(|drag| drag.preview_time)
-                                                .unwrap_or(event.time);
+                                            let preview_time = ladder_event_preview_time(
+                                                &event,
+                                                ladder_drag.get().as_ref(),
+                                            );
                                             let y = ladder_time_y(&diagram, preview_time);
                                             let x_left = x - 2.1;
                                             let x_right = x + 2.1;
                                             let y_top = y - 2.1;
                                             let y_bottom = y + 2.1;
-                                            let click_event_id = event_id.clone();
-                                            let click_status_label = status_label.clone();
                                             let drag_event_id = event_id.clone();
+                                            let context_event_id = event_id.clone();
                                             let drag_status_label = status_label.clone();
                                             view! {
                                                 <g
-                                                    class=if selected { "ladder-event selected" } else { "ladder-event" }
-                                                    on:click=move |_| {
-                                                        set_selected_ladder.set(click_event_id.clone());
-                                                        set_status.set(format!("Selected event: {click_status_label}"));
+                                                    class=if selected {
+                                                        "ladder-event selected"
+                                                    } else if symmetry_linked {
+                                                        "ladder-event symmetry-linked"
+                                                    } else {
+                                                        "ladder-event"
                                                     }
-                                                    on:mousedown=move |mouse_event: ev::MouseEvent| {
-                                                        mouse_event.prevent_default();
-                                                        mouse_event.stop_propagation();
+                                                    on:pointerdown=move |pointer_event: ev::PointerEvent| {
+                                                        if pointer_event.button() != 0 {
+                                                            return;
+                                                        }
+                                                        pointer_event.prevent_default();
+                                                        pointer_event.stop_propagation();
+                                                        capture_ladder_pointer(pointer_event.pointer_id());
+                                                        let was_selected = selected_ladder.get_untracked() == drag_event_id;
                                                         set_selected_ladder.set(drag_event_id.clone());
                                                         set_ladder_drag.set(Some(LadderDrag {
-                                                            kind: LadderDragKind::Event(event_index),
+                                                            kind: LadderDragKind::Event {
+                                                                primary_index: event_index,
+                                                                primary_time: event.primary_time,
+                                                            },
+                                                            pointer_id: pointer_event.pointer_id(),
+                                                            selected_id: drag_event_id.clone(),
+                                                            start_time: event.time,
                                                             preview_time: event.time,
+                                                            was_selected,
                                                         }));
                                                         set_status.set(format!("Dragging event: {drag_status_label}"));
                                                     }
+                                                    on:contextmenu=move |context_event| {
+                                                        open_ladder_context(context_event, context_event_id.clone());
+                                                    }
                                                 >
+                                                    <circle class="ladder-node-hitbox" cx=x cy=y r="3.2" />
                                                     <circle cx=x cy=y r="2.7" />
                                                     <line x1=x_left y1=y x2=x_right y2=y />
                                                     <line x1=x y1=y_top x2=x y2=y_bottom />
@@ -1294,71 +1685,6 @@ pub fn App() -> impl IntoView {
                                     ladder_selection_text(&current_spec.get(), &selected_ladder.get())
                                 }}
                             </p>
-                            <div class="ladder-actions">
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !selected_ladder_can_remove(&current_spec.get(), &selected_ladder.get())
-                                    on:click=remove_selected_ladder_item
-                                >
-                                    {move || selected_ladder_remove_label(&current_spec.get(), &selected_ladder.get())}
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !selected_ladder_can_define_throw(&current_spec.get(), &selected_ladder.get())
-                                    on:click=open_define_throw_dialog
-                                >
-                                    "Define Throw"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !selected_ladder_can_change_catch(&current_spec.get(), &selected_ladder.get(), MhnJmlTransitionType::Catch)
-                                    on:click=move |_| change_selected_ladder_catch(MhnJmlTransitionType::Catch)
-                                >
-                                    "Catch"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !selected_ladder_can_change_catch(&current_spec.get(), &selected_ladder.get(), MhnJmlTransitionType::SoftCatch)
-                                    on:click=move |_| change_selected_ladder_catch(MhnJmlTransitionType::SoftCatch)
-                                >
-                                    "Soft"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !selected_ladder_can_change_catch(&current_spec.get(), &selected_ladder.get(), MhnJmlTransitionType::GrabCatch)
-                                    on:click=move |_| change_selected_ladder_catch(MhnJmlTransitionType::GrabCatch)
-                                >
-                                    "Grab"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !selected_ladder_can_make_last(&current_spec.get(), &selected_ladder.get())
-                                    on:click=make_selected_ladder_transition_last
-                                >
-                                    "Make Last"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !ladder_can_add_position(&current_spec.get())
-                                    on:click=add_ladder_position_from_target
-                                >
-                                    "Add Position"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !ladder_can_add_event(&current_spec.get())
-                                    on:click=move |_| add_ladder_event_from_target(1)
-                                >
-                                    "Add Left Event"
-                                </button>
-                                <button
-                                    type="button"
-                                    prop:disabled=move || !ladder_can_add_event(&current_spec.get())
-                                    on:click=move |_| add_ladder_event_from_target(0)
-                                >
-                                    "Add Right Event"
-                                </button>
-                            </div>
                         </aside>
                     </div>
 
@@ -1376,6 +1702,141 @@ pub fn App() -> impl IntoView {
                     </div>
                 </section>
             </section>
+            {move || {
+                let Some(menu) = ladder_context_menu.get() else {
+                    return view! {}.into_any();
+                };
+                let spec = current_spec.get();
+                let selected_id = selected_ladder.get();
+                let can_add = selected_ladder_can_add_at_context(&spec, &selected_id);
+                let can_remove = selected_ladder_can_remove(&spec, &selected_id);
+                let can_define_prop = selected_ladder_can_define_prop(&spec, &selected_id);
+                let can_define_throw = selected_ladder_can_define_throw(&spec, &selected_id);
+                let can_catch = selected_ladder_can_change_catch(
+                    &spec,
+                    &selected_id,
+                    MhnJmlTransitionType::Catch,
+                );
+                let can_soft = selected_ladder_can_change_catch(
+                    &spec,
+                    &selected_id,
+                    MhnJmlTransitionType::SoftCatch,
+                );
+                let can_grab = selected_ladder_can_change_catch(
+                    &spec,
+                    &selected_id,
+                    MhnJmlTransitionType::GrabCatch,
+                );
+                let can_make_last = selected_ladder_can_make_last(&spec, &selected_id);
+                let menu_style = format!("left: {:.0}px; top: {:.0}px;", menu.x, menu.y);
+                view! {
+                    <div
+                        class="ladder-context-backdrop"
+                        on:click=move |_| finish_ladder_popup()
+                        on:contextmenu=move |event| {
+                            event.prevent_default();
+                            finish_ladder_popup();
+                        }
+                    >
+                        <div
+                            class="ladder-context-menu"
+                            style=menu_style
+                            on:click=move |event| event.stop_propagation()
+                            on:contextmenu=move |event| {
+                                event.prevent_default();
+                                event.stop_propagation();
+                            }
+                        >
+                            <button
+                                type="button"
+                                class=if can_add { "context-action" } else { "context-action hidden" }
+                                on:click=move |_| {
+                                    add_ladder_event_from_target(1);
+                                    finish_ladder_popup();
+                                }
+                            >"Add Left Event"</button>
+                            <button
+                                type="button"
+                                class=if can_add { "context-action" } else { "context-action hidden" }
+                                on:click=move |_| {
+                                    add_ladder_event_from_target(0);
+                                    finish_ladder_popup();
+                                }
+                            >"Add Right Event"</button>
+                            <button
+                                type="button"
+                                class=if can_remove { "context-action" } else { "context-action hidden" }
+                                on:click=move |event| {
+                                    remove_selected_ladder_item(event);
+                                    finish_ladder_popup();
+                                }
+                            >{selected_ladder_remove_label(&spec, &selected_id)}</button>
+                            <button
+                                type="button"
+                                class=if can_add { "context-action" } else { "context-action hidden" }
+                                on:click=move |event| {
+                                    add_ladder_position_from_target(event);
+                                    finish_ladder_popup();
+                                }
+                            >"Add Position"</button>
+                            <div class=if can_define_prop || can_define_throw || can_catch || can_soft || can_grab || can_make_last {
+                                "ladder-context-divider"
+                            } else {
+                                "ladder-context-divider hidden"
+                            }></div>
+                            <button
+                                type="button"
+                                class=if can_define_prop { "context-action" } else { "context-action hidden" }
+                                on:click=move |event| {
+                                    set_ladder_context_menu.set(None);
+                                    open_define_prop_dialog(event);
+                                }
+                            >"Define Prop"</button>
+                            <button
+                                type="button"
+                                class=if can_define_throw { "context-action" } else { "context-action hidden" }
+                                on:click=move |event| {
+                                    set_ladder_context_menu.set(None);
+                                    open_define_throw_dialog(event);
+                                }
+                            >"Define Throw"</button>
+                            <button
+                                type="button"
+                                class=if can_catch { "context-action" } else { "context-action hidden" }
+                                on:click=move |_| {
+                                    change_selected_ladder_catch(MhnJmlTransitionType::Catch);
+                                    finish_ladder_popup();
+                                }
+                            >"Change to Normal Catch"</button>
+                            <button
+                                type="button"
+                                class=if can_soft { "context-action" } else { "context-action hidden" }
+                                on:click=move |_| {
+                                    change_selected_ladder_catch(MhnJmlTransitionType::SoftCatch);
+                                    finish_ladder_popup();
+                                }
+                            >"Change to Soft Catch"</button>
+                            <button
+                                type="button"
+                                class=if can_grab { "context-action" } else { "context-action hidden" }
+                                on:click=move |_| {
+                                    change_selected_ladder_catch(MhnJmlTransitionType::GrabCatch);
+                                    finish_ladder_popup();
+                                }
+                            >"Change to Grab Catch"</button>
+                            <button
+                                type="button"
+                                class=if can_make_last { "context-action" } else { "context-action hidden" }
+                                on:click=move |event| {
+                                    make_selected_ladder_transition_last(event);
+                                    finish_ladder_popup();
+                                }
+                            >"Make Last in Event"</button>
+                        </div>
+                    </div>
+                }
+                .into_any()
+            }}
             {move || {
                 if define_throw_dialog.get().is_none() {
                     return view! {}.into_any();
@@ -1427,8 +1888,82 @@ pub fn App() -> impl IntoView {
                                 />
                             </div>
                             <div class="dialog-actions">
-                                <button type="button" on:click=move |_| set_define_throw_dialog.set(None)>"Cancel"</button>
+                                <button type="button" on:click=move |_| {
+                                    set_define_throw_dialog.set(None);
+                                    finish_ladder_popup();
+                                }>"Cancel"</button>
                                 <button type="button" class="primary" on:click=confirm_define_throw_dialog>"Apply"</button>
+                            </div>
+                        </section>
+                    </div>
+                }
+                .into_any()
+            }}
+            {move || {
+                if define_prop_dialog.get().is_none() {
+                    return view! {}.into_any();
+                }
+                view! {
+                    <div class="dialog-backdrop">
+                        <section class="dialog-panel">
+                            <div class="dialog-title">
+                                {move || {
+                                    define_prop_dialog
+                                        .get()
+                                        .map(|dialog| format!("Define Prop - Path {}", dialog.path))
+                                        .unwrap_or_else(|| "Define Prop".to_string())
+                                }}
+                            </div>
+                            <div class="dialog-grid">
+                                <label for="prop-type">"Type"</label>
+                                <select
+                                    id="prop-type"
+                                    prop:value=move || {
+                                        define_prop_dialog
+                                            .get()
+                                            .map(|dialog| dialog.prop_type)
+                                            .unwrap_or_else(|| "ball".to_string())
+                                    }
+                                    on:change=move |ev| {
+                                        let value = event_target_value(&ev).to_ascii_lowercase();
+                                        set_define_prop_dialog.update(|dialog| {
+                                            if let Some(dialog) = dialog {
+                                                dialog.prop_type = value;
+                                            }
+                                        });
+                                    }
+                                >
+                                    <option value="ball">"ball"</option>
+                                    <option value="ring">"ring"</option>
+                                    <option value="image">"image"</option>
+                                    <option value="square">"square"</option>
+                                </select>
+                                <label for="prop-mod">"Modifier"</label>
+                                <input
+                                    id="prop-mod"
+                                    type="text"
+                                    prop:value=move || {
+                                        define_prop_dialog
+                                            .get()
+                                            .and_then(|dialog| dialog.prop_mod)
+                                            .unwrap_or_default()
+                                    }
+                                    on:input=move |ev| {
+                                        let value = event_target_value(&ev);
+                                        set_define_prop_dialog.update(|dialog| {
+                                            if let Some(dialog) = dialog {
+                                                dialog.prop_mod = non_empty_trimmed(&value);
+                                            }
+                                        });
+                                    }
+                                />
+                            </div>
+                            <div class="dialog-actions">
+                                <button type="button" on:click=move |_| {
+                                    set_define_prop_dialog.set(None);
+                                    finish_ladder_popup();
+                                }>"Cancel"</button>
+                                <button type="button" class="primary" on:click=confirm_define_prop_dialog>"Apply"</button>
                             </div>
                         </section>
                     </div>
@@ -1534,6 +2069,19 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
     }
 }
 
+fn editor_shortcut_target_is_editable(event: &ev::KeyboardEvent) -> bool {
+    let Some(target) = event.target() else {
+        return false;
+    };
+    let Ok(element) = target.dyn_into::<web_sys::Element>() else {
+        return false;
+    };
+    matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
+        || element
+            .get_attribute("contenteditable")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 fn is_camera_key(key: &str) -> bool {
     matches!(
         key,
@@ -1615,6 +2163,24 @@ fn move_ladder_position_in_record(
             .then(left.juggler.cmp(&right.juggler))
     });
     record_from_edited_jml_model(record, model, "Ladder position edit rejected")
+}
+
+fn edit_ladder_position_spatial_in_record(
+    record: &PatternRecord,
+    position_index: usize,
+    position: BodyPosition,
+) -> Result<PatternRecord, String> {
+    let xml = record_to_pattern_jml(record)?;
+    let mut model = MhnJmlPattern::from_jml_xml(&xml)?;
+    let target = model
+        .positions
+        .get_mut(position_index)
+        .ok_or_else(|| "Selected ladder position is no longer available".to_string())?;
+    target.x = position.x;
+    target.y = position.y;
+    target.z = position.z;
+    target.angle = position.angle;
+    record_from_edited_jml_model(record, model, "Position spatial edit rejected")
 }
 
 fn add_ladder_position_in_record(
@@ -1876,6 +2442,212 @@ fn define_ladder_throw_in_record(
     record_from_edited_jml_model(record, model, "Define throw rejected")
 }
 
+fn define_ladder_prop_in_record(
+    record: &PatternRecord,
+    path: usize,
+    runtime_prop_assignment: &[usize],
+    prop_type: &str,
+    prop_mod: Option<&str>,
+) -> Result<PatternRecord, String> {
+    let prop_type = prop_type.trim().to_ascii_lowercase();
+    if !matches!(prop_type.as_str(), "ball" | "ring" | "image" | "square") {
+        return Err(format!("Prop type '{prop_type}' is not supported"));
+    }
+    let prop_mod = prop_mod.and_then(non_empty_trimmed);
+    PropSpec::from_jml(&prop_type, prop_mod.as_deref())?;
+
+    let xml = record_to_pattern_jml(record)?;
+    let mut model = MhnJmlPattern::from_jml_xml(&xml)?;
+    if path == 0 || path > model.number_of_paths {
+        return Err("Selected ladder path is no longer available".to_string());
+    }
+    ensure_prop_assignment(&mut model);
+    if runtime_prop_assignment.len() == model.number_of_paths
+        && runtime_prop_assignment
+            .iter()
+            .all(|assigned| *assigned > 0 && *assigned <= model.props.len())
+    {
+        model.prop_assignment = runtime_prop_assignment.to_vec();
+    }
+
+    let path_index = path - 1;
+    let current_prop_number = model.prop_assignment[path_index];
+    if current_prop_number > 0 && current_prop_number <= model.props.len() {
+        let still_used = model
+            .prop_assignment
+            .iter()
+            .enumerate()
+            .any(|(index, assigned)| index != path_index && *assigned == current_prop_number);
+        if !still_used {
+            model.props.remove(current_prop_number - 1);
+            for assigned in &mut model.prop_assignment {
+                if *assigned > current_prop_number {
+                    *assigned -= 1;
+                }
+            }
+        }
+    }
+
+    let matching_prop = model.props.iter().position(|prop| {
+        prop.prop_type.eq_ignore_ascii_case(&prop_type)
+            && option_eq_ignore_ascii_case(prop.modifier.as_deref(), prop_mod.as_deref())
+    });
+    let prop_number = if let Some(index) = matching_prop {
+        index + 1
+    } else {
+        model
+            .props
+            .push(MhnJmlProp::new(prop_type, prop_mod.clone()));
+        model.props.len()
+    };
+
+    model.prop_assignment[path_index] = prop_number;
+    record_from_edited_jml_model(record, model, "Define prop rejected")
+}
+
+fn ensure_prop_assignment(model: &mut MhnJmlPattern) {
+    if model.props.is_empty() {
+        model.props.push(MhnJmlProp::new("ball", None));
+    }
+    if model.prop_assignment.len() != model.number_of_paths {
+        model.prop_assignment = (0..model.number_of_paths)
+            .map(|index| index % model.props.len() + 1)
+            .collect();
+    }
+    for assigned in &mut model.prop_assignment {
+        if *assigned == 0 || *assigned > model.props.len() {
+            *assigned = 1;
+        }
+    }
+}
+
+fn option_eq_ignore_ascii_case(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn current_editor_snapshot(
+    records: ReadSignal<Vec<PatternRecord>>,
+    selected: ReadSignal<usize>,
+    pattern_source: ReadSignal<String>,
+    pattern_text: ReadSignal<String>,
+    draft: ReadSignal<String>,
+    selected_ladder: ReadSignal<String>,
+) -> EditorSnapshot {
+    let records = records.get_untracked();
+    let selected = if records.is_empty() {
+        0
+    } else {
+        selected.get_untracked().min(records.len() - 1)
+    };
+    EditorSnapshot {
+        records,
+        selected,
+        pattern_source: pattern_source.get_untracked(),
+        pattern_text: pattern_text.get_untracked(),
+        draft: draft.get_untracked(),
+        selected_ladder: selected_ladder.get_untracked(),
+    }
+}
+
+fn push_editor_history(
+    records: ReadSignal<Vec<PatternRecord>>,
+    selected: ReadSignal<usize>,
+    pattern_source: ReadSignal<String>,
+    pattern_text: ReadSignal<String>,
+    draft: ReadSignal<String>,
+    selected_ladder: ReadSignal<String>,
+    set_undo_stack: WriteSignal<Vec<EditorSnapshot>>,
+    set_redo_stack: WriteSignal<Vec<EditorSnapshot>>,
+) {
+    push_undo_snapshot(
+        records,
+        selected,
+        pattern_source,
+        pattern_text,
+        draft,
+        selected_ladder,
+        set_undo_stack,
+    );
+    set_redo_stack.set(Vec::new());
+}
+
+fn push_undo_snapshot(
+    records: ReadSignal<Vec<PatternRecord>>,
+    selected: ReadSignal<usize>,
+    pattern_source: ReadSignal<String>,
+    pattern_text: ReadSignal<String>,
+    draft: ReadSignal<String>,
+    selected_ladder: ReadSignal<String>,
+    set_undo_stack: WriteSignal<Vec<EditorSnapshot>>,
+) {
+    let snapshot = current_editor_snapshot(
+        records,
+        selected,
+        pattern_source,
+        pattern_text,
+        draft,
+        selected_ladder,
+    );
+    set_undo_stack.update(|stack| push_bounded_snapshot(stack, snapshot));
+}
+
+fn push_redo_snapshot(
+    records: ReadSignal<Vec<PatternRecord>>,
+    selected: ReadSignal<usize>,
+    pattern_source: ReadSignal<String>,
+    pattern_text: ReadSignal<String>,
+    draft: ReadSignal<String>,
+    selected_ladder: ReadSignal<String>,
+    set_redo_stack: WriteSignal<Vec<EditorSnapshot>>,
+) {
+    let snapshot = current_editor_snapshot(
+        records,
+        selected,
+        pattern_source,
+        pattern_text,
+        draft,
+        selected_ladder,
+    );
+    set_redo_stack.update(|stack| push_bounded_snapshot(stack, snapshot));
+}
+
+fn push_bounded_snapshot(stack: &mut Vec<EditorSnapshot>, snapshot: EditorSnapshot) {
+    if stack.last() == Some(&snapshot) {
+        return;
+    }
+    stack.push(snapshot);
+    if stack.len() > HISTORY_LIMIT {
+        let overflow = stack.len() - HISTORY_LIMIT;
+        stack.drain(0..overflow);
+    }
+}
+
+fn restore_editor_snapshot(
+    snapshot: EditorSnapshot,
+    set_records: WriteSignal<Vec<PatternRecord>>,
+    set_selected: WriteSignal<usize>,
+    set_pattern_source: WriteSignal<String>,
+    set_pattern_text: WriteSignal<String>,
+    set_draft: WriteSignal<String>,
+    set_selected_ladder: WriteSignal<String>,
+) {
+    let selected = if snapshot.records.is_empty() {
+        0
+    } else {
+        snapshot.selected.min(snapshot.records.len() - 1)
+    };
+    set_records.set(snapshot.records);
+    set_selected.set(selected);
+    set_pattern_source.set(snapshot.pattern_source);
+    set_pattern_text.set(snapshot.pattern_text);
+    set_draft.set(snapshot.draft);
+    set_selected_ladder.set(snapshot.selected_ladder);
+}
+
 fn replace_current_ladder_record(
     edited: PatternRecord,
     selected: ReadSignal<usize>,
@@ -1932,17 +2704,18 @@ fn record_from_edited_jml_model(
 }
 
 fn constrain_ladder_drag_time(diagram: &LadderDiagram, drag: &LadderDrag, time: f64) -> f64 {
-    match drag.kind {
-        LadderDragKind::Event(event_index) => diagram
-            .constrain_event_time(event_index, time)
+    match &drag.kind {
+        LadderDragKind::Event { .. } => diagram
+            .constrain_event_time(&drag.selected_id, time)
             .unwrap_or(time),
         LadderDragKind::Position(position_index) => diagram
-            .constrain_position_time(position_index, time)
+            .constrain_position_time(*position_index, time)
             .unwrap_or(time),
         LadderDragKind::Tracker { .. } => time.rem_euclid(diagram.period_secs.max(0.1)),
     }
 }
 
+#[derive(Clone)]
 struct LadderSegment {
     x1: f64,
     y1: f64,
@@ -1951,11 +2724,13 @@ struct LadderSegment {
     class_name: &'static str,
 }
 
+#[derive(Clone)]
 struct LadderArc {
     points: String,
     class_name: &'static str,
 }
 
+#[derive(Clone)]
 enum LadderShape {
     Line(LadderSegment),
     Arc(LadderArc),
@@ -2018,26 +2793,71 @@ fn ladder_edge_shape_view(shape: LadderShape) -> AnyView {
     }
 }
 
-fn ladder_edge_shapes(diagram: &LadderDiagram, edge: &LadderEdge) -> Vec<LadderShape> {
-    let x1 = ladder_endpoint_x(diagram, &edge.start);
-    let y1 = ladder_time_y(diagram, edge.start.time);
-    let x2 = ladder_endpoint_x(diagram, &edge.end);
-    let y2 = ladder_time_y(diagram, edge.end.time);
-    let class_name = ladder_edge_class(edge);
-
-    if !edge.wraps_period {
-        return vec![ladder_edge_shape_between(
-            diagram, edge, x1, y1, x2, y2, class_name,
-        )];
+fn ladder_edge_hit_shape_view(shape: LadderShape) -> AnyView {
+    match shape {
+        LadderShape::Line(segment) => view! {
+            <line
+                x1=segment.x1
+                y1=segment.y1
+                x2=segment.x2
+                y2=segment.y2
+                class="ladder-path-hitbox"
+            />
+        }
+        .into_any(),
+        LadderShape::Arc(arc) => view! {
+            <polyline points=arc.points class="ladder-path-hitbox" />
+        }
+        .into_any(),
     }
+}
 
-    let duration = edge.duration_secs().max(1e-9);
-    let wrap_fraction = ((diagram.period_secs - edge.start.time) / duration).clamp(0.0, 1.0);
-    let wrap_x = x1 + (x2 - x1) * wrap_fraction;
-    vec![
-        ladder_edge_shape_between(diagram, edge, x1, y1, wrap_x, 95.0, class_name),
-        ladder_edge_shape_between(diagram, edge, wrap_x, 5.0, x2, y2, class_name),
-    ]
+fn ladder_edge_shapes(
+    diagram: &LadderDiagram,
+    edge: &LadderEdge,
+    drag: Option<&LadderDrag>,
+) -> Vec<LadderShape> {
+    let x1 = ladder_endpoint_x(diagram, &edge.start);
+    let start_time = ladder_endpoint_preview_time(&edge.start, drag);
+    let y1 = ladder_absolute_time_y(diagram, start_time);
+    let x2 = ladder_endpoint_x(diagram, &edge.end);
+    let end_time = ladder_endpoint_preview_time(&edge.end, drag);
+    let y2 = ladder_absolute_time_y(diagram, end_time);
+    let class_name = ladder_edge_class(edge);
+    vec![ladder_edge_shape_between(
+        diagram, edge, x1, y1, x2, y2, class_name,
+    )]
+}
+
+fn ladder_endpoint_preview_time(endpoint: &LadderEndpoint, drag: Option<&LadderDrag>) -> f64 {
+    ladder_primary_preview_time(endpoint.event_index, endpoint.time, drag)
+}
+
+fn ladder_event_preview_time(event: &LadderEvent, drag: Option<&LadderDrag>) -> f64 {
+    ladder_primary_preview_time(event.event_index, event.time, drag)
+}
+
+fn ladder_transition_preview_time(transition: &LadderTransition, drag: Option<&LadderDrag>) -> f64 {
+    ladder_primary_preview_time(transition.event_index, transition.time, drag)
+}
+
+fn ladder_primary_preview_time(
+    primary_index: usize,
+    original_time: f64,
+    drag: Option<&LadderDrag>,
+) -> f64 {
+    let Some(drag) = drag else {
+        return original_time;
+    };
+    match &drag.kind {
+        LadderDragKind::Event {
+            primary_index: dragged_primary,
+            ..
+        } if *dragged_primary == primary_index => {
+            original_time + drag.preview_time - drag.start_time
+        }
+        _ => original_time,
+    }
 }
 
 fn ladder_edge_shape_between(
@@ -2129,11 +2949,33 @@ fn ladder_self_throw_points(
 }
 
 fn ladder_track_x(diagram: &LadderDiagram, track_index: usize) -> f64 {
-    let count = diagram.tracks.len().max(1);
-    if count == 1 {
+    const BORDER_SIDES: f64 = 0.15;
+    const JUGGLER_SEPARATION: f64 = 0.45;
+    let Some(track) = diagram
+        .tracks
+        .iter()
+        .find(|track| track.index == track_index)
+    else {
         return 50.0;
-    }
-    16.0 + (track_index as f64 / (count - 1) as f64) * 68.0
+    };
+    let jugglers = diagram
+        .tracks
+        .iter()
+        .map(|track| track.juggler)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let width_units = 2.0 * BORDER_SIDES
+        + jugglers as f64
+        + (jugglers.saturating_sub(1)) as f64 * JUGGLER_SEPARATION;
+    let hand_offset = match track.hand {
+        LadderHand::Left => 0.0,
+        LadderHand::Right => 1.0,
+    };
+    let x_units = BORDER_SIDES
+        + (track.juggler.saturating_sub(1)) as f64 * (1.0 + JUGGLER_SEPARATION)
+        + hand_offset;
+    100.0 * x_units / width_units
 }
 
 fn ladder_endpoint_x(diagram: &LadderDiagram, endpoint: &LadderEndpoint) -> f64 {
@@ -2147,11 +2989,12 @@ fn ladder_transition_x(diagram: &LadderDiagram, transition: &LadderTransition) -
 }
 
 fn ladder_transition_x_from_parts(track_x: f64, hand: LadderHand, transition_index: usize) -> f64 {
+    const TRANSITION_SLOT_SPACING: f64 = 5.4;
     let direction = match hand {
         LadderHand::Left => 1.0,
         LadderHand::Right => -1.0,
     };
-    track_x + direction * (transition_index as f64 + 1.0) * 3.5
+    track_x + direction * (transition_index as f64 + 1.0) * TRANSITION_SLOT_SPACING
 }
 
 fn ladder_position_x(diagram: &LadderDiagram, juggler: usize) -> f64 {
@@ -2172,7 +3015,24 @@ fn ladder_time_y(diagram: &LadderDiagram, time: f64) -> f64 {
     LADDER_TOP_Y + (time.rem_euclid(diagram.period_secs) / diagram.period_secs) * LADDER_HEIGHT
 }
 
+fn ladder_playback_cycle(diagram: &LadderDiagram, time: f64) -> i64 {
+    (time / diagram.period_secs.max(0.1)).floor() as i64
+}
+
+fn ladder_time_in_cycle(diagram: &LadderDiagram, cycle: i64, local_time: f64) -> f64 {
+    let period = diagram.period_secs.max(0.1);
+    cycle as f64 * period + local_time.clamp(0.0, period - 1e-6)
+}
+
+fn ladder_absolute_time_y(diagram: &LadderDiagram, time: f64) -> f64 {
+    LADDER_TOP_Y + (time / diagram.period_secs) * LADDER_HEIGHT
+}
+
 fn ladder_time_from_mouse(event: &ev::MouseEvent, diagram: &LadderDiagram) -> Option<f64> {
+    ladder_time_from_client_y(event.client_y(), diagram)
+}
+
+fn ladder_time_from_client_y(client_y: i32, diagram: &LadderDiagram) -> Option<f64> {
     let element = window()?.document()?.get_element_by_id("ladder-svg")?;
     let rect = element.get_bounding_client_rect();
     let height = rect.height();
@@ -2180,13 +3040,17 @@ fn ladder_time_from_mouse(event: &ev::MouseEvent, diagram: &LadderDiagram) -> Op
         return None;
     }
 
-    let y = ((event.client_y() as f64 - rect.top()) / height * 100.0)
+    let y = ((client_y as f64 - rect.top()) / height * 100.0)
         .clamp(LADDER_TOP_Y, LADDER_TOP_Y + LADDER_HEIGHT);
     let fraction = (y - LADDER_TOP_Y) / LADDER_HEIGHT;
     Some(fraction * diagram.period_secs.max(0.1))
 }
 
 fn ladder_juggler_from_mouse(event: &ev::MouseEvent, diagram: &LadderDiagram) -> Option<usize> {
+    ladder_juggler_from_client_x(event.client_x(), diagram)
+}
+
+fn ladder_juggler_from_client_x(client_x: i32, diagram: &LadderDiagram) -> Option<usize> {
     let element = window()?.document()?.get_element_by_id("ladder-svg")?;
     let rect = element.get_bounding_client_rect();
     let width = rect.width();
@@ -2194,7 +3058,7 @@ fn ladder_juggler_from_mouse(event: &ev::MouseEvent, diagram: &LadderDiagram) ->
         return None;
     }
 
-    let x = ((event.client_x() as f64 - rect.left()) / width * 100.0).clamp(0.0, 100.0);
+    let x = ((client_x as f64 - rect.left()) / width * 100.0).clamp(0.0, 100.0);
     (1..=diagram
         .tracks
         .iter()
@@ -2208,9 +3072,49 @@ fn ladder_juggler_from_mouse(event: &ev::MouseEvent, diagram: &LadderDiagram) ->
         })
 }
 
+fn capture_ladder_pointer(pointer_id: i32) {
+    if let Some(element) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("ladder-svg"))
+    {
+        element.set_pointer_capture(pointer_id).ok();
+    }
+}
+
+fn release_ladder_pointer(pointer_id: i32) {
+    if let Some(element) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("ladder-svg"))
+    {
+        if element.has_pointer_capture(pointer_id) {
+            element.release_pointer_capture(pointer_id).ok();
+        }
+    }
+}
+
+fn ladder_context_position(client_x: f64, client_y: f64) -> (f64, f64) {
+    const MENU_WIDTH: f64 = 220.0;
+    const MENU_HEIGHT: f64 = 410.0;
+    const MARGIN: f64 = 8.0;
+    let viewport_width = window()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|value| value.as_f64())
+        .unwrap_or(client_x + MENU_WIDTH + MARGIN);
+    let viewport_height = window()
+        .and_then(|window| window.inner_height().ok())
+        .and_then(|value| value.as_f64())
+        .unwrap_or(client_y + MENU_HEIGHT + MARGIN);
+    (
+        client_x.clamp(MARGIN, (viewport_width - MENU_WIDTH - MARGIN).max(MARGIN)),
+        client_y.clamp(MARGIN, (viewport_height - MENU_HEIGHT - MARGIN).max(MARGIN)),
+    )
+}
+
 fn ladder_edge_class(edge: &LadderEdge) -> &'static str {
     if edge.includes_holding() {
         "hold-throw"
+    } else if edge.is_pass() {
+        "pass-throw"
     } else if edge.is_crossing() {
         "cross-throw"
     } else {
@@ -2254,6 +3158,17 @@ fn ladder_transition_class(transition: &LadderTransition) -> &'static str {
         TransitionKind::GrabCatch => "transition-grabcatch",
         TransitionKind::Holding => "transition-holding",
     }
+}
+
+fn ladder_prop_style(spec: &AnimationSpec, path: usize, time: f64) -> String {
+    let color = match &spec.kind {
+        AnimationKind::Jml(jml) => jml
+            .prop_for_path_at_time(path, time)
+            .and_then(|prop| prop.color.clone())
+            .unwrap_or_else(|| "#d8dde6".to_string()),
+        AnimationKind::Unavailable(_) => "#d8dde6".to_string(),
+    };
+    format!("--ladder-prop-color: {color};")
 }
 
 fn ladder_position_label(position: &LadderPosition) -> String {
@@ -2324,9 +3239,40 @@ fn selected_ladder_transition(spec: &AnimationSpec, selected_id: &str) -> Option
         .find(|transition| transition.id == selected_id)
 }
 
+fn selected_ladder_position_index(spec: &AnimationSpec, selected_id: &str) -> Option<usize> {
+    ladder_diagram(spec)?
+        .positions
+        .into_iter()
+        .find(|position| position.id == selected_id)
+        .map(|position| position.position_index)
+}
+
 fn selected_ladder_can_define_throw(spec: &AnimationSpec, selected_id: &str) -> bool {
     selected_ladder_transition(spec, selected_id)
         .is_some_and(|transition| transition.transition == TransitionKind::Throw)
+}
+
+fn selected_ladder_can_define_prop(spec: &AnimationSpec, selected_id: &str) -> bool {
+    selected_ladder_path(spec, selected_id).is_some()
+}
+
+fn selected_ladder_can_add_at_context(spec: &AnimationSpec, selected_id: &str) -> bool {
+    ladder_can_add_event(spec)
+        && ladder_can_add_position(spec)
+        && (selected_id.is_empty()
+            || ladder_diagram(spec)
+                .is_some_and(|diagram| diagram.edges.iter().any(|edge| edge.id == selected_id)))
+}
+
+fn selected_ladder_has_context_actions(spec: &AnimationSpec, selected_id: &str) -> bool {
+    selected_ladder_can_add_at_context(spec, selected_id)
+        || selected_ladder_can_remove(spec, selected_id)
+        || selected_ladder_can_define_prop(spec, selected_id)
+        || selected_ladder_can_define_throw(spec, selected_id)
+        || selected_ladder_can_change_catch(spec, selected_id, MhnJmlTransitionType::Catch)
+        || selected_ladder_can_change_catch(spec, selected_id, MhnJmlTransitionType::SoftCatch)
+        || selected_ladder_can_change_catch(spec, selected_id, MhnJmlTransitionType::GrabCatch)
+        || selected_ladder_can_make_last(spec, selected_id)
 }
 
 fn selected_ladder_throw_draft(
@@ -2347,6 +3293,54 @@ fn selected_ladder_throw_draft(
             .to_ascii_lowercase(),
         throw_mod: transition.throw_mod,
     })
+}
+
+fn selected_ladder_prop_draft(
+    record: &PatternRecord,
+    spec: &AnimationSpec,
+    selected_id: &str,
+    time: f64,
+) -> Result<Option<DefinePropDraft>, String> {
+    let Some(path) = selected_ladder_path(spec, selected_id) else {
+        return Ok(None);
+    };
+    let xml = record_to_pattern_jml(record)?;
+    let mut model = MhnJmlPattern::from_jml_xml(&xml)?;
+    ensure_prop_assignment(&mut model);
+    let prop_assignment = match &spec.kind {
+        AnimationKind::Jml(jml) => jml.prop_assignment_at_time(time),
+        AnimationKind::Unavailable(_) => model.prop_assignment.clone(),
+    };
+    let prop_number = prop_assignment[path - 1].saturating_sub(1);
+    let prop = model
+        .props
+        .get(prop_number)
+        .cloned()
+        .unwrap_or_else(|| MhnJmlProp::new("ball", None));
+
+    Ok(Some(DefinePropDraft {
+        path,
+        selected_id: selected_id.to_string(),
+        prop_assignment,
+        playback_time: time.rem_euclid(spec.period_secs.max(0.1)),
+        prop_type: prop.prop_type.to_ascii_lowercase(),
+        prop_mod: prop.modifier,
+    }))
+}
+
+fn selected_ladder_path(spec: &AnimationSpec, selected_id: &str) -> Option<usize> {
+    let diagram = ladder_diagram(spec)?;
+    if let Some(transition) = diagram
+        .transitions
+        .iter()
+        .find(|transition| transition.id == selected_id)
+    {
+        return Some(transition.path);
+    }
+    if let Some(edge) = diagram.edges.iter().find(|edge| edge.id == selected_id) {
+        return Some(edge.path);
+    }
+    None
 }
 
 fn selected_ladder_can_change_catch(

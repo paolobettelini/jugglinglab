@@ -3,6 +3,7 @@ use crate::layout::LaidoutPattern;
 use crate::mhn_body::BodyPosition;
 use crate::mhn_jml::MhnJmlPattern;
 use crate::mhn_matrix::MhnMatrix;
+use crate::permutation::Permutation;
 use crate::prop::PropSpec;
 use crate::siteswap::{self, SiteswapSpec};
 use roxmltree::{Document, Node};
@@ -31,8 +32,11 @@ pub struct JmlAnimation {
     pub period_secs: f64,
     pub props: Vec<PropSpec>,
     pub prop_assignment: Vec<usize>,
+    pub path_permutation: Permutation,
     pub positions: Vec<BodyPosition>,
     pub events: Vec<JmlEvent>,
+    pub loop_event_images: Vec<JmlEventImage>,
+    pub all_event_images: Vec<JmlEventImage>,
     pub path_events: Vec<Vec<PathEvent>>,
     pub layout: Option<LaidoutPattern>,
 }
@@ -41,6 +45,28 @@ impl JmlAnimation {
     pub fn prop_for_path(&self, path: usize) -> Option<&PropSpec> {
         let prop_index = self
             .prop_assignment
+            .get(path.checked_sub(1)?)?
+            .checked_sub(1)?;
+        self.props.get(prop_index)
+    }
+
+    pub fn prop_assignment_at_time(&self, time: f64) -> Vec<usize> {
+        let period = self.period_secs.max(0.1);
+        let cycles = (time / period).floor() as i32;
+        (1..=self.paths)
+            .map(|path| {
+                let source_path = self.path_permutation.map_power(path as i32, cycles);
+                self.prop_assignment
+                    .get(source_path.max(1) as usize - 1)
+                    .copied()
+                    .unwrap_or(1)
+            })
+            .collect()
+    }
+
+    pub fn prop_for_path_at_time(&self, path: usize, time: f64) -> Option<&PropSpec> {
+        let prop_index = self
+            .prop_assignment_at_time(time)
             .get(path.checked_sub(1)?)?
             .checked_sub(1)?;
         self.props.get(prop_index)
@@ -55,6 +81,13 @@ pub struct JmlEvent {
     pub z: f64,
     pub hand: String,
     pub transitions: Vec<JmlTransition>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JmlEventImage {
+    pub event: JmlEvent,
+    pub primary_index: usize,
+    pub primary_time: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -295,7 +328,6 @@ pub fn parse_jml_animation(xml: &str) -> Result<JmlAnimation, String> {
         });
     }
 
-    events.sort_by(|a, b| a.t.total_cmp(&b.t));
     let mut path_events = vec![Vec::new(); paths];
     for event in &events {
         for transition in &event.transitions {
@@ -317,7 +349,47 @@ pub fn parse_jml_animation(xml: &str) -> Result<JmlAnimation, String> {
         path.sort_by(|a, b| a.t.total_cmp(&b.t));
     }
 
-    let layout = MhnJmlPattern::from_jml_xml(xml).ok().and_then(|mut model| {
+    let model = MhnJmlPattern::from_jml_xml(xml).ok();
+    let convert_images = |images: Vec<crate::mhn_jml::MhnEventImage>, model: &MhnJmlPattern| {
+        images
+            .into_iter()
+            .filter_map(|image| {
+                let primary_time = model.events.get(image.primary_index)?.t;
+                Some(JmlEventImage {
+                    event: jml_event_from_mhn(&image.event),
+                    primary_index: image.primary_index,
+                    primary_time,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let all_event_images = model
+        .as_ref()
+        .and_then(|model| Some(convert_images(model.all_event_images().ok()?, model)))
+        .filter(|images| !images.is_empty())
+        .unwrap_or_else(|| {
+            events
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(primary_index, event)| JmlEventImage {
+                    primary_time: event.t,
+                    event,
+                    primary_index,
+                })
+                .collect()
+        });
+    let loop_event_images = all_event_images
+        .iter()
+        .filter(|image| image.event.t >= -1e-9 && image.event.t < period_secs - 1e-9)
+        .cloned()
+        .collect::<Vec<_>>();
+    let path_permutation = model
+        .as_ref()
+        .and_then(|model| model.path_permutation().ok())
+        .cloned()
+        .unwrap_or_else(|| Permutation::identity(paths));
+    let layout = model.and_then(|mut model| {
         model.merge_coincident_events();
         LaidoutPattern::from_jml_pattern(&model)
             .or_else(|_| LaidoutPattern::from_jml_pattern_unchecked(&model))
@@ -332,11 +404,44 @@ pub fn parse_jml_animation(xml: &str) -> Result<JmlAnimation, String> {
         period_secs,
         props,
         prop_assignment,
+        path_permutation,
         positions,
         events,
+        loop_event_images,
+        all_event_images,
         path_events,
         layout,
     })
+}
+
+fn jml_event_from_mhn(event: &crate::mhn_jml::MhnJmlEvent) -> JmlEvent {
+    JmlEvent {
+        t: event.t,
+        x: event.x,
+        y: event.y,
+        z: event.z,
+        hand: format!(
+            "{}:{}",
+            event.juggler,
+            if event.hand == 1 { "left" } else { "right" }
+        ),
+        transitions: event
+            .transitions
+            .iter()
+            .map(|transition| JmlTransition {
+                path: transition.path,
+                kind: match transition.transition_type {
+                    crate::mhn_jml::MhnJmlTransitionType::Throw => TransitionKind::Throw,
+                    crate::mhn_jml::MhnJmlTransitionType::Catch => TransitionKind::Catch,
+                    crate::mhn_jml::MhnJmlTransitionType::SoftCatch => TransitionKind::SoftCatch,
+                    crate::mhn_jml::MhnJmlTransitionType::GrabCatch => TransitionKind::GrabCatch,
+                    crate::mhn_jml::MhnJmlTransitionType::Holding => TransitionKind::Holding,
+                },
+                throw_type: transition.throw_type.clone(),
+                throw_mod: transition.throw_mod.clone(),
+            })
+            .collect(),
+    }
 }
 
 pub fn lerp_point(a: Point3, b: Point3, u: f64) -> Point3 {
@@ -525,6 +630,31 @@ mod tests {
         assert_eq!(jml.prop_assignment, vec![1, 2, 1]);
         assert_eq!(jml.prop_for_path(1).unwrap().diameter, 14.0);
         assert_eq!(jml.prop_for_path(2).unwrap().inside_diameter, Some(18.0));
+    }
+
+    #[test]
+    fn prop_assignment_follows_delay_path_permutation_between_loops() {
+        let xml = r#"
+        <jml version="3"><pattern>
+        <setup jugglers="1" paths="3" props="1,2,3"/>
+        <prop type="ball" mod="color=red"/>
+        <prop type="ring" mod="color=green"/>
+        <prop type="square" mod="color=blue"/>
+        <symmetry type="delay" pperm="(1,2,3)" delay="1"/>
+        <event x="0" y="0" z="0" t="0" hand="1:right">
+          <throw path="1" type="toss"/><catch path="2"/><holding path="3"/>
+        </event>
+        </pattern></jml>
+        "#;
+        let jml = parse_jml_animation(xml).unwrap();
+
+        assert_eq!(jml.prop_assignment_at_time(0.25), vec![1, 2, 3]);
+        assert_eq!(jml.prop_assignment_at_time(1.25), vec![2, 3, 1]);
+        assert_eq!(jml.prop_assignment_at_time(2.25), vec![3, 1, 2]);
+        assert_eq!(
+            jml.prop_for_path_at_time(1, 1.25).unwrap().kind,
+            crate::prop::PropKind::Ring
+        );
     }
 
     #[test]
