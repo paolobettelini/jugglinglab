@@ -1,5 +1,5 @@
 use juggling_core::animation::{AnimationKind, AnimationSpec, JmlAnimation, Point3};
-use juggling_core::layout::{JugglerFrame, LayoutBounds};
+use juggling_core::layout::{JugglerFrame, LaidoutPattern, LayoutBounds, LayoutEvent};
 use juggling_core::mhn_hands::Coordinate;
 use juggling_core::prop::{PropKind, PropSpec};
 use std::cell::RefCell;
@@ -22,7 +22,41 @@ pub struct RenderSettings {
     pub paused: bool,
     pub show_trails: bool,
     pub show_grid: bool,
+    pub selected_event: Option<EventSelection>,
     pub selected_position: Option<usize>,
+    pub position_edit_handle: Option<PositionEditHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EventSelection {
+    pub primary_index: usize,
+    pub time: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventEditHandle {
+    Xz,
+    Y,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventEditorHit {
+    pub primary_index: usize,
+    pub event_time: f64,
+    pub image_hand: usize,
+    pub handle: EventEditHandle,
+    pub local_x_dx: f64,
+    pub local_x_dy: f64,
+    pub local_y_dx: f64,
+    pub local_y_dy: f64,
+    pub z_dx: f64,
+    pub z_dy: f64,
+}
+
+#[derive(Clone, Debug)]
+struct EventEditorHitObject {
+    hit: EventEditorHit,
+    shape: HitShape,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,7 +129,13 @@ enum HitShape {
 
 impl HitObject {
     fn contains(&self, x: f64, y: f64) -> bool {
-        match self.shape {
+        self.shape.contains(x, y)
+    }
+}
+
+impl HitShape {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        match *self {
             HitShape::Circle {
                 x: cx,
                 y: cy,
@@ -190,6 +230,9 @@ enum RenderObjectKind {
     Line {
         juggler: usize,
     },
+    Trail {
+        alpha: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +271,7 @@ struct Rgba {
 thread_local! {
     static ANIMATOR: RefCell<Option<CanvasAnimator>> = const { RefCell::new(None) };
     static LAST_HITS: RefCell<Vec<HitObject>> = const { RefCell::new(Vec::new()) };
+    static LAST_EVENT_HITS: RefCell<Vec<EventEditorHitObject>> = const { RefCell::new(Vec::new()) };
     static LAST_POSITION_HITS: RefCell<Vec<PositionEditorHitObject>> = const { RefCell::new(Vec::new()) };
     static IMAGE_CACHE: RefCell<HashMap<String, HtmlImageElement>> = RefCell::new(HashMap::new());
     static PLAYBACK_CLOCK: RefCell<PlaybackClock> = RefCell::new(PlaybackClock {
@@ -518,6 +562,20 @@ impl RenderObject {
         }
     }
 
+    fn trail(start: Coordinate, end: Coordinate, alpha: f64, camera: &RenderCamera) -> Self {
+        let coords = [start, end]
+            .into_iter()
+            .map(point_from_coordinate)
+            .map(|point| camera.project(point))
+            .collect::<Vec<_>>();
+        Self {
+            kind: RenderObjectKind::Trail { alpha },
+            bounds: Bounds::from_points(&coords, 2.0),
+            coords,
+            covering: Vec::new(),
+        }
+    }
+
     fn is_covering(&self, other: &RenderObject) -> bool {
         if !self.bounds.overlaps(other.bounds) {
             return false;
@@ -531,9 +589,10 @@ impl RenderObject {
                 plane_depth_at(other, self.coords[0].x, self.coords[0].y)
                     .is_some_and(|depth| self.coords[0].z < depth)
             }
-            (RenderObjectKind::Prop { .. }, RenderObjectKind::Line { .. }) => {
-                box_covering_line(self, other) == 1
-            }
+            (
+                RenderObjectKind::Prop { .. },
+                RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. },
+            ) => box_covering_line(self, other) == 1,
             (RenderObjectKind::Body { .. }, RenderObjectKind::Prop { .. }) => {
                 plane_depth_at(self, other.coords[0].x, other.coords[0].y)
                     .is_some_and(|depth| depth < other.coords[0].z)
@@ -547,14 +606,18 @@ impl RenderObject {
                     .sum::<f64>()
                     < 0.0
             }
-            (RenderObjectKind::Body { .. }, RenderObjectKind::Line { .. }) => {
-                box_covering_line(self, other) == 1
-            }
-            (RenderObjectKind::Line { .. }, RenderObjectKind::Prop { .. })
-            | (RenderObjectKind::Line { .. }, RenderObjectKind::Body { .. }) => {
-                box_covering_line(other, self) == -1
-            }
-            (RenderObjectKind::Line { .. }, RenderObjectKind::Line { .. }) => false,
+            (
+                RenderObjectKind::Body { .. },
+                RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. },
+            ) => box_covering_line(self, other) == 1,
+            (
+                RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. },
+                RenderObjectKind::Prop { .. } | RenderObjectKind::Body { .. },
+            ) => box_covering_line(other, self) == -1,
+            (
+                RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. },
+                RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. },
+            ) => false,
         }
     }
 }
@@ -733,6 +796,27 @@ pub fn position_editor_hit_by_id(
     })
 }
 
+pub fn event_editor_hit_by_id(
+    canvas_id: &str,
+    client_x: f64,
+    client_y: f64,
+) -> Option<EventEditorHit> {
+    let canvas = window()
+        .and_then(|win| win.document())
+        .and_then(|document| document.get_element_by_id(canvas_id))
+        .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())?;
+    let rect = canvas.get_bounding_client_rect();
+    let x = client_x - rect.left();
+    let y = client_y - rect.top();
+    LAST_EVENT_HITS.with(|hits| {
+        hits.borrow()
+            .iter()
+            .rev()
+            .find(|item| item.shape.contains(x, y))
+            .map(|item| item.hit.clone())
+    })
+}
+
 pub fn stop() {
     ANIMATOR.with(|slot| {
         if let Some(animator) = slot.borrow_mut().take() {
@@ -755,6 +839,7 @@ fn draw(
 
     let palette = Palette::for_theme(&settings.theme);
     LAST_HITS.with(|hits| hits.borrow_mut().clear());
+    LAST_EVENT_HITS.with(|hits| hits.borrow_mut().clear());
     LAST_POSITION_HITS.with(|hits| hits.borrow_mut().clear());
     ctx.set_fill_style_str(palette.background);
     ctx.fill_rect(0.0, 0.0, width, height);
@@ -845,7 +930,7 @@ fn draw_jml_layout_scene(
             let point = point_from_coordinate(coord);
             if settings.show_trails {
                 if let Ok(trail) = layout.path_trail_coordinates(path, t, 0.32, 18) {
-                    draw_coordinate_trail_with_camera(ctx, &camera, palette, &trail);
+                    push_trail_render_objects(&mut objects, &camera, &trail);
                 }
             }
             let prop = jml
@@ -860,12 +945,515 @@ fn draw_jml_layout_scene(
         push_ground_render_objects(&mut objects, jml, &camera);
     }
 
+    if settings.selected_position.is_some() && camera.pitch < 70.0_f64.to_radians() {
+        draw_position_grid(ctx, &camera, width, height, palette);
+    }
+
     for index in sorted_render_order(&mut objects) {
         draw_render_object(ctx, &objects[index], palette);
     }
-    if let Some(position_index) = settings.selected_position {
-        draw_position_editor(ctx, &camera, jml, position_index, palette);
+    if let Some(selection) = settings.selected_event {
+        draw_event_editor(ctx, &camera, jml, selection, palette);
     }
+    if let Some(position_index) = settings.selected_position {
+        draw_position_editor(
+            ctx,
+            &camera,
+            jml,
+            position_index,
+            settings.position_edit_handle,
+            palette,
+        );
+    }
+}
+
+fn draw_event_editor(
+    ctx: &CanvasRenderingContext2d,
+    camera: &RenderCamera,
+    jml: &JmlAnimation,
+    selection: EventSelection,
+    palette: &Palette,
+) {
+    const EVENT_BOX_HALF_CM: f64 = 5.0;
+    const NEIGHBOR_BOX_HALF_CM: f64 = 2.0;
+    const Y_HANDLE_CM: f64 = 10.0;
+    const HAND_PATH_STEP_SECS: f64 = 0.005;
+    let Some(layout) = &jml.layout else {
+        return;
+    };
+    let Some(selected_index) = selected_layout_event_index(layout, selection, jml.period_secs)
+    else {
+        return;
+    };
+    let selected = &layout.events[selected_index];
+    let juggler = selected.event.juggler;
+    let hand = selected.event.hand;
+    let mut visible_indices = vec![selected_index];
+    let mut hand_path_start = selected.event.t;
+    let mut hand_path_end = selected.event.t;
+
+    for (index, candidate) in layout.events.iter().enumerate().skip(selected_index + 1) {
+        if candidate.event.juggler != juggler || candidate.event.hand != hand {
+            continue;
+        }
+        hand_path_end = hand_path_end.max(candidate.event.t);
+        if candidate.primary_index == selected.primary_index {
+            break;
+        }
+        visible_indices.push(index);
+        if event_has_throw_or_catch(candidate) {
+            break;
+        }
+    }
+    for (index, candidate) in layout.events[..selected_index].iter().enumerate().rev() {
+        if candidate.event.juggler != juggler || candidate.event.hand != hand {
+            continue;
+        }
+        hand_path_start = hand_path_start.min(candidate.event.t);
+        if candidate.primary_index == selected.primary_index {
+            break;
+        }
+        visible_indices.push(index);
+        if event_has_throw_or_catch(candidate) {
+            break;
+        }
+    }
+
+    draw_hand_path_overlay(
+        ctx,
+        camera,
+        layout,
+        juggler,
+        hand,
+        hand_path_start,
+        hand_path_end,
+        HAND_PATH_STEP_SECS,
+        palette,
+    );
+
+    for index in visible_indices
+        .iter()
+        .copied()
+        .filter(|index| *index != selected_index)
+    {
+        let event = &layout.events[index];
+        let center_world = point_from_coordinate(event.global_coordinate);
+        let angle = layout
+            .juggler_angle(event.event.juggler, event.event.t)
+            .unwrap_or(0.0)
+            .to_radians();
+        let (axis_x, _, axis_z) = event_projected_axes(*camera, center_world, angle);
+        draw_event_xz_box(
+            ctx,
+            camera.project(center_world),
+            axis_x,
+            axis_z,
+            NEIGHBOR_BOX_HALF_CM,
+            palette,
+        );
+    }
+
+    let center_world = point_from_coordinate(selected.global_coordinate);
+    let center = camera.project(center_world);
+    let angle = layout
+        .juggler_angle(selected.event.juggler, selected.event.t)
+        .unwrap_or(0.0)
+        .to_radians();
+    let (axis_x, axis_y, axis_z) = event_projected_axes(*camera, center_world, angle);
+    let xz_area = (axis_x.0 * axis_z.1 - axis_x.1 * axis_z.0).abs();
+    let show_xz = xz_area > 0.015;
+    let show_y = axis_y.0.hypot(axis_y.1) > 0.08;
+    let geometry = EventEditorHit {
+        primary_index: selection.primary_index,
+        event_time: selected.event.t,
+        image_hand: selected.event.hand,
+        handle: EventEditHandle::Xz,
+        local_x_dx: axis_x.0,
+        local_x_dy: axis_x.1,
+        local_y_dx: axis_y.0,
+        local_y_dy: axis_y.1,
+        z_dx: axis_z.0,
+        z_dy: axis_z.1,
+    };
+
+    ctx.set_fill_style_str(palette.highlight);
+    ctx.begin_path();
+    ctx.arc(center.x, center.y, 2.0, 0.0, std::f64::consts::TAU)
+        .ok();
+    ctx.fill();
+
+    if show_xz {
+        let corners = event_xz_corners(center, axis_x, axis_z, EVENT_BOX_HALF_CM);
+        draw_event_xz_box(ctx, center, axis_x, axis_z, EVENT_BOX_HALF_CM, palette);
+        LAST_EVENT_HITS.with(|hits| {
+            hits.borrow_mut().push(EventEditorHitObject {
+                hit: geometry.clone(),
+                shape: HitShape::Polygon(corners.to_vec()),
+            });
+        });
+    }
+
+    if show_y {
+        let front = (
+            center.x + axis_y.0 * Y_HANDLE_CM,
+            center.y + axis_y.1 * Y_HANDLE_CM,
+        );
+        let back = (
+            center.x - axis_y.0 * Y_HANDLE_CM,
+            center.y - axis_y.1 * Y_HANDLE_CM,
+        );
+        ctx.set_stroke_style_str(palette.highlight);
+        ctx.set_line_width(1.0);
+        ctx.begin_path();
+        ctx.move_to(front.0, front.1);
+        ctx.line_to(back.0, back.1);
+        ctx.stroke();
+        draw_event_axis_arrow(ctx, front, axis_y, true);
+        draw_event_axis_arrow(ctx, back, axis_y, false);
+        let mut hit = geometry;
+        hit.handle = EventEditHandle::Y;
+        LAST_EVENT_HITS.with(|hits| {
+            hits.borrow_mut().push(EventEditorHitObject {
+                hit,
+                shape: HitShape::Segment {
+                    x1: front.0,
+                    y1: front.1,
+                    x2: back.0,
+                    y2: back.1,
+                    radius: 6.0,
+                },
+            });
+        });
+    }
+}
+
+fn selected_layout_event_index(
+    layout: &LaidoutPattern,
+    selection: EventSelection,
+    period_secs: f64,
+) -> Option<usize> {
+    layout
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.primary_index == selection.primary_index)
+        .min_by(|(_, left), (_, right)| {
+            cyclic_time_distance(left.event.t, selection.time, period_secs)
+                .total_cmp(&cyclic_time_distance(
+                    right.event.t,
+                    selection.time,
+                    period_secs,
+                ))
+                .then_with(|| left.event.t.total_cmp(&right.event.t))
+        })
+        .map(|(index, _)| index)
+}
+
+fn cyclic_time_distance(left: f64, right: f64, period: f64) -> f64 {
+    if period <= 0.0 {
+        return (left - right).abs();
+    }
+    let delta = (left - right).rem_euclid(period);
+    delta.min(period - delta)
+}
+
+fn event_has_throw_or_catch(event: &LayoutEvent) -> bool {
+    event
+        .event
+        .transitions
+        .iter()
+        .any(|transition| transition.transition_type.is_throw_or_catch())
+}
+
+fn event_projected_axes(
+    camera: RenderCamera,
+    center: Point3,
+    juggler_angle: f64,
+) -> ((f64, f64), (f64, f64), (f64, f64)) {
+    let local_x = Point3 {
+        x: juggler_angle.cos(),
+        y: juggler_angle.sin(),
+        z: 0.0,
+    };
+    let local_y = Point3 {
+        x: -juggler_angle.sin(),
+        y: juggler_angle.cos(),
+        z: 0.0,
+    };
+    let world_z = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    (
+        projected_axis(camera, center, local_x),
+        projected_axis(camera, center, local_y),
+        projected_axis(camera, center, world_z),
+    )
+}
+
+fn event_xz_corners(
+    center: ScreenPoint,
+    axis_x: (f64, f64),
+    axis_z: (f64, f64),
+    half_size: f64,
+) -> [(f64, f64); 4] {
+    [
+        screen_offset(center, axis_x, axis_z, -half_size, -half_size),
+        screen_offset(center, axis_x, axis_z, -half_size, half_size),
+        screen_offset(center, axis_x, axis_z, half_size, half_size),
+        screen_offset(center, axis_x, axis_z, half_size, -half_size),
+    ]
+}
+
+fn draw_event_xz_box(
+    ctx: &CanvasRenderingContext2d,
+    center: ScreenPoint,
+    axis_x: (f64, f64),
+    axis_z: (f64, f64),
+    half_size: f64,
+    palette: &Palette,
+) {
+    let corners = event_xz_corners(center, axis_x, axis_z, half_size);
+    ctx.set_stroke_style_str(palette.highlight);
+    ctx.set_line_width(1.25);
+    ctx.begin_path();
+    ctx.move_to(corners[0].0, corners[0].1);
+    for point in &corners[1..] {
+        ctx.line_to(point.0, point.1);
+    }
+    ctx.close_path();
+    ctx.stroke();
+}
+
+fn draw_event_axis_arrow(
+    ctx: &CanvasRenderingContext2d,
+    endpoint: (f64, f64),
+    axis: (f64, f64),
+    forward: bool,
+) {
+    let length = axis.0.hypot(axis.1);
+    if length <= 1e-9 {
+        return;
+    }
+    let direction = if forward { 1.0 } else { -1.0 };
+    let ux = axis.0 / length * direction;
+    let uy = axis.1 / length * direction;
+    let px = -uy;
+    let py = ux;
+    ctx.begin_path();
+    ctx.move_to(endpoint.0, endpoint.1);
+    ctx.line_to(
+        endpoint.0 - ux * 5.0 + px * 2.5,
+        endpoint.1 - uy * 5.0 + py * 2.5,
+    );
+    ctx.move_to(endpoint.0, endpoint.1);
+    ctx.line_to(
+        endpoint.0 - ux * 5.0 - px * 2.5,
+        endpoint.1 - uy * 5.0 - py * 2.5,
+    );
+    ctx.stroke();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_hand_path_overlay(
+    ctx: &CanvasRenderingContext2d,
+    camera: &RenderCamera,
+    layout: &LaidoutPattern,
+    juggler: usize,
+    hand: usize,
+    start_time: f64,
+    end_time: f64,
+    requested_step: f64,
+    palette: &Palette,
+) {
+    let duration = (end_time - start_time).max(0.0);
+    if duration <= 1e-9 {
+        return;
+    }
+    let sample_count = (duration / requested_step).ceil().clamp(1.0, 2000.0) as usize;
+    let mut previous = layout
+        .hand_coordinate(juggler, hand, start_time)
+        .ok()
+        .map(point_from_coordinate)
+        .map(|point| camera.project(point));
+    ctx.set_stroke_style_str(palette.trail);
+    ctx.set_line_width(1.25);
+    let mut dash_phase = 0.0;
+    for sample in 1..=sample_count {
+        let time = start_time + duration * sample as f64 / sample_count as f64;
+        let Some(current) = layout
+            .hand_coordinate(juggler, hand, time)
+            .ok()
+            .map(point_from_coordinate)
+            .map(|point| camera.project(point))
+        else {
+            previous = None;
+            continue;
+        };
+        if let Some(previous) = previous {
+            if layout.is_hand_holding(juggler, hand, time + 0.0001) {
+                ctx.begin_path();
+                ctx.move_to(previous.x, previous.y);
+                ctx.line_to(current.x, current.y);
+                ctx.stroke();
+            } else {
+                draw_dashed_segment(ctx, previous, current, 5.7, 5.0, &mut dash_phase);
+            }
+        }
+        previous = Some(current);
+    }
+}
+
+fn draw_dashed_segment(
+    ctx: &CanvasRenderingContext2d,
+    start: ScreenPoint,
+    end: ScreenPoint,
+    dash: f64,
+    gap: f64,
+    phase: &mut f64,
+) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = dx.hypot(dy);
+    if length <= 1e-9 {
+        return;
+    }
+    let ux = dx / length;
+    let uy = dy / length;
+    let cycle = dash + gap;
+    let mut offset = 0.0;
+    while offset < length {
+        let in_dash = *phase < dash;
+        let boundary = if in_dash { dash } else { cycle };
+        let step = (boundary - *phase).min(length - offset);
+        if in_dash {
+            ctx.begin_path();
+            ctx.move_to(start.x + ux * offset, start.y + uy * offset);
+            ctx.line_to(
+                start.x + ux * (offset + step),
+                start.y + uy * (offset + step),
+            );
+            ctx.stroke();
+        }
+        offset += step;
+        *phase = (*phase + step).rem_euclid(cycle);
+    }
+}
+
+fn draw_position_grid(
+    ctx: &CanvasRenderingContext2d,
+    camera: &RenderCamera,
+    width: f64,
+    height: f64,
+    palette: &Palette,
+) {
+    const GRID_SPACING_CM: f64 = 20.0;
+    const MAX_GRID_LINES: i32 = 240;
+    let origin = camera.project(Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    });
+    let x_step_point = camera.project(Point3 {
+        x: GRID_SPACING_CM,
+        y: 0.0,
+        z: 0.0,
+    });
+    let y_step_point = camera.project(Point3 {
+        x: 0.0,
+        y: GRID_SPACING_CM,
+        z: 0.0,
+    });
+    let axis_x = (x_step_point.x - origin.x, x_step_point.y - origin.y);
+    let axis_y = (y_step_point.x - origin.x, y_step_point.y - origin.y);
+    let determinant = axis_x.0 * axis_y.1 - axis_x.1 * axis_y.0;
+    if determinant.abs() <= 1e-6 {
+        return;
+    }
+
+    let mut m_min = i32::MAX;
+    let mut m_max = i32::MIN;
+    let mut n_min = i32::MAX;
+    let mut n_max = i32::MIN;
+    for (x, y) in [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)] {
+        let Some((m, n)) = solve_screen_vectors(
+            x - origin.x,
+            y - origin.y,
+            axis_x.0,
+            axis_x.1,
+            axis_y.0,
+            axis_y.1,
+        ) else {
+            return;
+        };
+        m_min = m_min.min(m.floor() as i32);
+        m_max = m_max.max(m.ceil() as i32);
+        n_min = n_min.min(n.floor() as i32);
+        n_max = n_max.max(n.ceil() as i32);
+    }
+    limit_grid_range(&mut m_min, &mut m_max, MAX_GRID_LINES);
+    limit_grid_range(&mut n_min, &mut n_max, MAX_GRID_LINES);
+
+    ctx.set_stroke_style_str(palette.trail);
+    ctx.set_global_alpha(0.48);
+    for m in m_min..=m_max {
+        let start = (
+            origin.x + m as f64 * axis_x.0 + n_min as f64 * axis_y.0,
+            origin.y + m as f64 * axis_x.1 + n_min as f64 * axis_y.1,
+        );
+        let end = (
+            origin.x + m as f64 * axis_x.0 + n_max as f64 * axis_y.0,
+            origin.y + m as f64 * axis_x.1 + n_max as f64 * axis_y.1,
+        );
+        ctx.set_line_width(if m == 0 { 2.0 } else { 0.75 });
+        ctx.begin_path();
+        ctx.move_to(start.0, start.1);
+        ctx.line_to(end.0, end.1);
+        ctx.stroke();
+    }
+    for n in n_min..=n_max {
+        let start = (
+            origin.x + m_min as f64 * axis_x.0 + n as f64 * axis_y.0,
+            origin.y + m_min as f64 * axis_x.1 + n as f64 * axis_y.1,
+        );
+        let end = (
+            origin.x + m_max as f64 * axis_x.0 + n as f64 * axis_y.0,
+            origin.y + m_max as f64 * axis_x.1 + n as f64 * axis_y.1,
+        );
+        ctx.set_line_width(if n == 0 { 2.0 } else { 0.75 });
+        ctx.begin_path();
+        ctx.move_to(start.0, start.1);
+        ctx.line_to(end.0, end.1);
+        ctx.stroke();
+    }
+    ctx.set_global_alpha(1.0);
+}
+
+fn solve_screen_vectors(
+    dx: f64,
+    dy: f64,
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
+) -> Option<(f64, f64)> {
+    let determinant = ax * by - ay * bx;
+    (determinant.abs() > 1e-9).then(|| {
+        (
+            (by * dx - bx * dy) / determinant,
+            (-ay * dx + ax * dy) / determinant,
+        )
+    })
+}
+
+fn limit_grid_range(minimum: &mut i32, maximum: &mut i32, limit: i32) {
+    if *maximum - *minimum <= limit {
+        return;
+    }
+    let midpoint = (*minimum as i64 + *maximum as i64) / 2;
+    *minimum = (midpoint - (limit / 2) as i64) as i32;
+    *maximum = *minimum + limit;
 }
 
 fn draw_position_editor(
@@ -873,9 +1461,11 @@ fn draw_position_editor(
     camera: &RenderCamera,
     jml: &JmlAnimation,
     position_index: usize,
+    active_handle: Option<PositionEditHandle>,
     palette: &Palette,
 ) {
     const BOX_HALF_CM: f64 = 10.0;
+    const BOX_HIT_HALF_CM: f64 = 15.0;
     const Z_HANDLE_CM: f64 = 20.0;
     const ANGLE_HANDLE_CM: f64 = 20.0;
     let Some(position) = jml.positions.get(position_index) else {
@@ -910,6 +1500,10 @@ fn draw_position_editor(
     let show_xy = pitch_diff > 20.0_f64.to_radians();
     let show_angle = show_xy;
     let show_z = pitch_diff < 60.0_f64.to_radians();
+    let dragging = active_handle.is_some();
+    let draw_xy = show_xy || dragging;
+    let draw_z = show_z && (!dragging || active_handle == Some(PositionEditHandle::Z));
+    let draw_angle = show_angle && (!dragging || active_handle == Some(PositionEditHandle::Angle));
     let geometry = PositionEditorHit {
         position_index,
         handle: PositionEditHandle::Xy,
@@ -931,7 +1525,8 @@ fn draw_position_editor(
         .ok();
     ctx.fill();
 
-    if show_xy {
+    let mut xy_hit_shape = None;
+    if draw_xy {
         let corners = [
             screen_offset(center, axis_x, axis_y, -BOX_HALF_CM, -BOX_HALF_CM),
             screen_offset(center, axis_x, axis_y, -BOX_HALF_CM, BOX_HALF_CM),
@@ -945,15 +1540,18 @@ fn draw_position_editor(
         }
         ctx.close_path();
         ctx.stroke();
-        LAST_POSITION_HITS.with(|hits| {
-            hits.borrow_mut().push(PositionEditorHitObject {
-                hit: geometry.clone(),
-                shape: HitShape::Polygon(corners.to_vec()),
-            });
-        });
+        if show_xy {
+            let hit_corners = [
+                screen_offset(center, axis_x, axis_y, -BOX_HIT_HALF_CM, -BOX_HIT_HALF_CM),
+                screen_offset(center, axis_x, axis_y, -BOX_HIT_HALF_CM, BOX_HIT_HALF_CM),
+                screen_offset(center, axis_x, axis_y, BOX_HIT_HALF_CM, BOX_HIT_HALF_CM),
+                screen_offset(center, axis_x, axis_y, BOX_HIT_HALF_CM, -BOX_HIT_HALF_CM),
+            ];
+            xy_hit_shape = Some(HitShape::Polygon(hit_corners.to_vec()));
+        }
     }
 
-    if show_z {
+    if draw_z {
         let z_end = (
             center.x + axis_z.0 * Z_HANDLE_CM,
             center.y + axis_z.1 * Z_HANDLE_CM,
@@ -979,7 +1577,7 @@ fn draw_position_editor(
         });
     }
 
-    if show_angle {
+    if draw_angle {
         let angle_end = (
             center.x - axis_y.0 * ANGLE_HANDLE_CM,
             center.y - axis_y.1 * ANGLE_HANDLE_CM,
@@ -989,7 +1587,7 @@ fn draw_position_editor(
         ctx.line_to(angle_end.0, angle_end.1);
         ctx.stroke();
         draw_editor_handle(ctx, angle_end.0, angle_end.1, 5.0);
-        let mut hit = geometry;
+        let mut hit = geometry.clone();
         hit.handle = PositionEditHandle::Angle;
         LAST_POSITION_HITS.with(|hits| {
             hits.borrow_mut().push(PositionEditorHitObject {
@@ -999,6 +1597,52 @@ fn draw_position_editor(
                     y: angle_end.1,
                     radius: 8.0,
                 },
+            });
+        });
+    }
+
+    if active_handle == Some(PositionEditHandle::Angle) {
+        let start = (center.x - axis_y.0 * 250.0, center.y - axis_y.1 * 250.0);
+        let end = (center.x + axis_y.0 * 250.0, center.y + axis_y.1 * 250.0);
+        ctx.set_line_width(1.0);
+        ctx.begin_path();
+        ctx.move_to(start.0, start.1);
+        ctx.line_to(end.0, end.1);
+        ctx.stroke();
+    } else if active_handle == Some(PositionEditHandle::Z) || camera.pitch < 70.0_f64.to_radians() {
+        let ground = camera.project(Point3 {
+            x: position.x,
+            y: position.y,
+            z: 0.0,
+        });
+        ctx.set_line_width(1.0);
+        ctx.begin_path();
+        ctx.move_to(center.x, center.y);
+        ctx.line_to(ground.x, ground.y);
+        ctx.stroke();
+        ctx.begin_path();
+        ctx.arc(ground.x, ground.y, 3.5, 0.0, std::f64::consts::TAU)
+            .ok();
+        ctx.fill();
+        if active_handle == Some(PositionEditHandle::Z) {
+            ctx.set_fill_style_str(palette.text_muted);
+            ctx.set_font("13px system-ui, sans-serif");
+            ctx.fill_text(
+                &format!("z = {:.1} cm", position.z),
+                ground.x + 7.0,
+                ground.y + 24.0,
+            )
+            .ok();
+        }
+    }
+
+    // Plane movement wins at the shared center; Z remains available on the
+    // exposed shaft and arrow head above the plane.
+    if let Some(shape) = xy_hit_shape {
+        LAST_POSITION_HITS.with(|hits| {
+            hits.borrow_mut().push(PositionEditorHitObject {
+                hit: geometry,
+                shape,
             });
         });
     }
@@ -1032,8 +1676,7 @@ fn screen_offset(
 
 fn draw_editor_handle(ctx: &CanvasRenderingContext2d, x: f64, y: f64, radius: f64) {
     ctx.begin_path();
-    ctx.arc(x, y, radius, 0.0, std::f64::consts::TAU)
-        .ok();
+    ctx.arc(x, y, radius, 0.0, std::f64::consts::TAU).ok();
     ctx.fill();
 }
 
@@ -1183,7 +1826,12 @@ fn sorted_render_order(objects: &mut [RenderObject]) -> Vec<usize> {
             if drawn[i] {
                 continue;
             }
-            if pass == 0 && !matches!(objects[i].kind, RenderObjectKind::Line { .. }) {
+            if pass == 0
+                && !matches!(
+                    objects[i].kind,
+                    RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. }
+                )
+            {
                 continue;
             }
             drawn[i] = true;
@@ -1226,6 +1874,20 @@ fn draw_render_object(ctx: &CanvasRenderingContext2d, object: &RenderObject, pal
                     7.0,
                 );
             }
+        }
+        RenderObjectKind::Trail { alpha } => {
+            if object.coords.len() < 2 {
+                return;
+            }
+            ctx.save();
+            ctx.set_stroke_style_str(palette.trail);
+            ctx.set_line_width(1.6);
+            ctx.set_global_alpha(*alpha);
+            ctx.begin_path();
+            ctx.move_to(object.coords[0].x, object.coords[0].y);
+            ctx.line_to(object.coords[1].x, object.coords[1].y);
+            ctx.stroke();
+            ctx.restore();
         }
     }
 }
@@ -1358,7 +2020,8 @@ fn cached_image(source: &str) -> Option<HtmlImageElement> {
 }
 
 fn image_source_url(source: &str) -> String {
-    let trimmed = source.trim();
+    let decoded = source.trim().replace("%3B", ";").replace("%3b", ";");
+    let trimmed = decoded.as_str();
     if trimmed.contains('/') || trimmed.starts_with("data:") {
         trimmed.to_string()
     } else {
@@ -1579,22 +2242,17 @@ fn draw_line_object(
     ctx.restore();
 }
 
-fn draw_coordinate_trail_with_camera(
-    ctx: &CanvasRenderingContext2d,
+fn push_trail_render_objects(
+    objects: &mut Vec<RenderObject>,
     camera: &RenderCamera,
-    palette: &Palette,
     points: &[Coordinate],
 ) {
     if points.len() < 2 {
         return;
     }
 
-    ctx.save();
-    ctx.set_stroke_style_str(palette.trail);
-    ctx.set_line_width(1.6);
-    ctx.set_global_alpha(0.55);
-    ctx.begin_path();
     let mut previous_world = None::<Point3>;
+    let mut previous_coordinate = None::<Coordinate>;
     let mut previous_screen = None::<ScreenPoint>;
     for (index, coordinate) in points.iter().copied().enumerate() {
         let world = point_from_coordinate(coordinate);
@@ -1604,16 +2262,16 @@ fn draw_coordinate_trail_with_camera(
             || previous_screen.is_some_and(|previous| {
                 screen_distance(previous.x, previous.y, point.x, point.y) > TRAIL_MAX_SCREEN_STEP_PX
             });
-        if index == 0 || discontinuous {
-            ctx.move_to(point.x, point.y);
-        } else {
-            ctx.line_to(point.x, point.y);
+        if index > 0 && !discontinuous {
+            if let Some(previous) = previous_coordinate {
+                let alpha = 0.12 + 0.43 * (index as f64 / (points.len() - 1) as f64);
+                objects.push(RenderObject::trail(previous, coordinate, alpha, camera));
+            }
         }
         previous_world = Some(world);
+        previous_coordinate = Some(coordinate);
         previous_screen = Some(point);
     }
-    ctx.stroke();
-    ctx.restore();
 }
 
 fn draw_hud(ctx: &CanvasRenderingContext2d, spec: &AnimationSpec, width: f64, palette: &Palette) {
@@ -1994,9 +2652,7 @@ fn point_in_polygon(x: f64, y: f64, points: &[(f64, f64)]) -> bool {
     for current in 0..points.len() {
         let (xi, yi) = points[current];
         let (xj, yj) = points[previous];
-        if ((yi > y) != (yj > y))
-            && x < (xj - xi) * (y - yi) / (yj - yi) + xi
-        {
+        if ((yi > y) != (yj > y)) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
             inside = !inside;
         }
         previous = current;
@@ -2052,8 +2708,10 @@ fn box_covering_line(box_object: &RenderObject, line_object: &RenderObject) -> i
     if !matches!(
         box_object.kind,
         RenderObjectKind::Body { .. } | RenderObjectKind::Prop { .. }
-    ) || !matches!(line_object.kind, RenderObjectKind::Line { .. })
-        || line_object.coords.len() < 2
+    ) || !matches!(
+        line_object.kind,
+        RenderObjectKind::Line { .. } | RenderObjectKind::Trail { .. }
+    ) || line_object.coords.len() < 2
     {
         return 0;
     }

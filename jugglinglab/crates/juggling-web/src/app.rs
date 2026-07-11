@@ -6,9 +6,10 @@ use juggling_core::ladder::{
     LadderTransition, build_ladder_diagram,
 };
 use juggling_core::mhn_body::BodyPosition;
+use juggling_core::mhn_hands::Coordinate;
 use juggling_core::mhn_jml::{MhnJmlEvent, MhnJmlPattern, MhnJmlProp, MhnJmlTransitionType};
 use juggling_core::mhn_matrix::MhnMatrix;
-use juggling_core::prop::PropSpec;
+use juggling_core::prop::{PropKind, PropSpec};
 use juggling_core::{library, siteswap};
 use leptos::ev;
 use leptos::prelude::*;
@@ -69,6 +70,17 @@ struct PositionCanvasDrag {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct EventCanvasDrag {
+    hit: canvas::EventEditorHit,
+    start_client_x: f64,
+    start_client_y: f64,
+    start_image: Coordinate,
+    start_primary: MhnJmlEvent,
+    original_record: PatternRecord,
+    checkpointed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct DefineThrowDraft {
     event_index: usize,
     transition_index: usize,
@@ -85,6 +97,8 @@ struct DefinePropDraft {
     playback_time: f64,
     prop_type: String,
     prop_mod: Option<String>,
+    image_source: String,
+    image_width: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,6 +157,7 @@ pub fn App() -> impl IntoView {
     let (undo_stack, set_undo_stack) = signal(Vec::<EditorSnapshot>::new());
     let (redo_stack, set_redo_stack) = signal(Vec::<EditorSnapshot>::new());
     let (view_drag_start, set_view_drag_start) = signal(None::<(f64, f64)>);
+    let (event_canvas_drag, set_event_canvas_drag) = signal(None::<EventCanvasDrag>);
     let (position_canvas_drag, set_position_canvas_drag) = signal(None::<PositionCanvasDrag>);
     let (view_dragged, set_view_dragged) = signal(false);
     let (pressed_camera_keys, set_pressed_camera_keys) = signal(Vec::<String>::new());
@@ -192,10 +207,15 @@ pub fn App() -> impl IntoView {
             paused: !playing.get() || view_drag_start.get().is_some(),
             show_trails: show_trails.get(),
             show_grid: show_grid.get(),
+            selected_event: selected_ladder_event_selection(
+                &current_spec.get(),
+                &selected_ladder.get(),
+            ),
             selected_position: selected_ladder_position_index(
                 &current_spec.get(),
                 &selected_ladder.get(),
             ),
+            position_edit_handle: position_canvas_drag.get().map(|drag| drag.hit.handle),
         };
         canvas::start_by_id("juggling-stage", current_spec.get(), settings);
     });
@@ -218,10 +238,17 @@ pub fn App() -> impl IntoView {
                 paused: true,
                 show_trails: show_trails.get_untracked(),
                 show_grid: show_grid.get_untracked(),
+                selected_event: selected_ladder_event_selection(
+                    &current_spec.get_untracked(),
+                    &selected_ladder.get_untracked(),
+                ),
                 selected_position: selected_ladder_position_index(
                     &current_spec.get_untracked(),
                     &selected_ladder.get_untracked(),
                 ),
+                position_edit_handle: position_canvas_drag
+                    .get_untracked()
+                    .map(|drag| drag.hit.handle),
             },
         );
     };
@@ -601,19 +628,154 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    let start_canvas_drag = move |event: ev::MouseEvent| {
+    let start_canvas_drag = move |event: ev::PointerEvent| {
         event.prevent_default();
         if let Some(canvas) = event
             .target()
             .and_then(|target| target.dyn_into::<HtmlCanvasElement>().ok())
         {
             canvas.focus().ok();
+            canvas.set_pointer_capture(event.pointer_id()).ok();
+        }
+        if let Some(hit) = canvas::event_editor_hit_by_id(
+            "juggling-stage",
+            event.client_x() as f64,
+            event.client_y() as f64,
+        ) {
+            let Some(record) = current_record.get_untracked() else {
+                return;
+            };
+            let spec = current_spec.get_untracked();
+            match event_drag_sources(&record, &spec, &hit) {
+                Ok((start_image, start_primary)) => {
+                    set_selected_object.set(format!(
+                        "J{} {} event",
+                        start_primary.juggler,
+                        if hit.image_hand == 0 { "right" } else { "left" }
+                    ));
+                    set_event_canvas_drag.set(Some(EventCanvasDrag {
+                        hit,
+                        start_client_x: event.client_x() as f64,
+                        start_client_y: event.client_y() as f64,
+                        start_image,
+                        start_primary,
+                        original_record: record,
+                        checkpointed: false,
+                    }));
+                    set_view_drag_start.set(None);
+                    set_view_dragged.set(false);
+                    set_status.set("Editing event position".to_string());
+                }
+                Err(err) => set_status.set(err),
+            }
+            return;
+        }
+        if let Some(hit) = canvas::position_editor_hit_by_id(
+            "juggling-stage",
+            event.client_x() as f64,
+            event.client_y() as f64,
+        ) {
+            let Some(record) = current_record.get_untracked() else {
+                return;
+            };
+            let spec = current_spec.get_untracked();
+            let Some(start_position) = (match &spec.kind {
+                AnimationKind::Jml(jml) => jml.positions.get(hit.position_index).copied(),
+                AnimationKind::Unavailable(_) => None,
+            }) else {
+                return;
+            };
+            set_selected_ladder.set(format!("position-{}", hit.position_index + 1));
+            set_selected_object.set(format!("J{} position", start_position.juggler));
+            set_position_canvas_drag.set(Some(PositionCanvasDrag {
+                hit,
+                start_client_x: event.client_x() as f64,
+                start_client_y: event.client_y() as f64,
+                start_position,
+                original_record: record,
+                checkpointed: false,
+            }));
+            set_view_drag_start.set(None);
+            set_view_dragged.set(false);
+            set_status.set("Editing juggler position".to_string());
+            return;
         }
         set_view_drag_start.set(Some((event.client_x() as f64, event.client_y() as f64)));
         set_view_dragged.set(false);
     };
 
-    let drag_canvas_view = move |event: ev::MouseEvent| {
+    let drag_canvas_view = move |event: ev::PointerEvent| {
+        if let Some(mut drag) = event_canvas_drag.get_untracked() {
+            event.prevent_default();
+            let dx = event.client_x() as f64 - drag.start_client_x;
+            let dy = event.client_y() as f64 - drag.start_client_y;
+            if dx.abs() + dy.abs() <= 0.0 {
+                return;
+            }
+            if !drag.checkpointed {
+                checkpoint_editor();
+                drag.checkpointed = true;
+            }
+            let primary = event_from_canvas_drag(&drag, dx, dy);
+            match edit_ladder_event_spatial_in_record(
+                &drag.original_record,
+                drag.hit.primary_index,
+                primary,
+            ) {
+                Ok(edited) => {
+                    replace_current_ladder_record(
+                        edited,
+                        selected,
+                        set_selected,
+                        set_records,
+                        set_pattern_source,
+                        set_pattern_text,
+                        set_draft,
+                    );
+                    set_status.set(event_edit_status(drag.hit.handle, primary));
+                }
+                Err(err) => set_status.set(err),
+            }
+            set_event_canvas_drag.set(Some(drag));
+            set_view_dragged.set(true);
+            return;
+        }
+        if let Some(mut drag) = position_canvas_drag.get_untracked() {
+            event.prevent_default();
+            let dx = event.client_x() as f64 - drag.start_client_x;
+            let dy = event.client_y() as f64 - drag.start_client_y;
+            if dx.abs() + dy.abs() <= 0.0 {
+                return;
+            }
+            if !drag.checkpointed {
+                checkpoint_editor();
+                drag.checkpointed = true;
+            }
+            let position = position_from_canvas_drag(&drag, dx, dy);
+            match edit_ladder_position_spatial_in_record(
+                &drag.original_record,
+                drag.hit.position_index,
+                position,
+            ) {
+                Ok(edited) => {
+                    replace_current_ladder_record(
+                        edited,
+                        selected,
+                        set_selected,
+                        set_records,
+                        set_pattern_source,
+                        set_pattern_text,
+                        set_draft,
+                    );
+                    set_selected_ladder.set(format!("position-{}", drag.hit.position_index + 1));
+                    set_status.set(position_edit_status(drag.hit.handle, position));
+                }
+                Err(err) => set_status.set(err),
+            }
+            set_position_canvas_drag.set(Some(drag));
+            set_view_dragged.set(true);
+            return;
+        }
         let Some((last_x, last_y)) = view_drag_start.get_untracked() else {
             return;
         };
@@ -634,8 +796,34 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    let end_canvas_drag = move |event: ev::MouseEvent| {
+    let end_canvas_drag = move |event: ev::PointerEvent| {
         event.prevent_default();
+        if let Some(canvas) = window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("juggling-stage"))
+        {
+            if canvas.has_pointer_capture(event.pointer_id()) {
+                canvas.release_pointer_capture(event.pointer_id()).ok();
+            }
+        }
+        if let Some(drag) = event_canvas_drag.get_untracked() {
+            set_event_canvas_drag.set(None);
+            set_status.set(if drag.checkpointed {
+                "Event position changed".to_string()
+            } else {
+                "Event selected".to_string()
+            });
+            return;
+        }
+        if let Some(drag) = position_canvas_drag.get_untracked() {
+            set_position_canvas_drag.set(None);
+            set_status.set(if drag.checkpointed {
+                "Juggler position changed".to_string()
+            } else {
+                "Juggler position selected".to_string()
+            });
+            return;
+        }
         if view_drag_start.get_untracked().is_some() {
             set_status.set("View adjusted".to_string());
         }
@@ -1034,12 +1222,20 @@ pub fn App() -> impl IntoView {
             return;
         };
 
+        let prop_mod = if dialog.prop_type.eq_ignore_ascii_case("image") {
+            Some(image_prop_modifier(
+                &dialog.image_source,
+                dialog.image_width,
+            ))
+        } else {
+            dialog.prop_mod.clone()
+        };
         match define_ladder_prop_in_record(
             &record,
             dialog.path,
             &dialog.prop_assignment,
             &dialog.prop_type,
-            dialog.prop_mod.as_deref(),
+            prop_mod.as_deref(),
         ) {
             Ok(edited) => {
                 commit_ladder_record(edited);
@@ -1052,6 +1248,38 @@ pub fn App() -> impl IntoView {
             }
             Err(err) => set_status.set(err),
         }
+    };
+
+    let choose_custom_prop_image = move |event: ev::Event| {
+        let input = event_target::<HtmlInputElement>(&event);
+        let Some(file) = input.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        let Ok(reader) = FileReader::new() else {
+            set_status.set("Could not read the selected image".to_string());
+            return;
+        };
+        let reader_clone = reader.clone();
+        let onload = Closure::wrap(Box::new(move |_event: Event| {
+            let Some(data_url) = reader_clone
+                .result()
+                .ok()
+                .and_then(|value| value.as_string())
+            else {
+                set_status.set("Could not decode the selected image".to_string());
+                return;
+            };
+            set_define_prop_dialog.update(|dialog| {
+                if let Some(dialog) = dialog {
+                    dialog.prop_type = "image".to_string();
+                    dialog.image_source = encode_image_source_for_modifier(&data_url);
+                }
+            });
+            set_status.set("Custom prop image loaded".to_string());
+        }) as Box<dyn FnMut(_)>);
+        reader.set_onload(Some(onload.as_ref().unchecked_ref()));
+        reader.read_as_data_url(&file).ok();
+        onload.forget();
     };
 
     let remove_selected_ladder_item = move |_| {
@@ -1343,10 +1571,10 @@ pub fn App() -> impl IntoView {
                                 id="juggling-stage"
                                 class="stage-canvas"
                                 tabindex="0"
-                                on:mousedown=start_canvas_drag
-                                on:mousemove=drag_canvas_view
-                                on:mouseup=end_canvas_drag
-                                on:mouseleave=end_canvas_drag
+                                on:pointerdown=start_canvas_drag
+                                on:pointermove=drag_canvas_view
+                                on:pointerup=end_canvas_drag
+                                on:pointercancel=end_canvas_drag
                                 on:wheel=zoom_canvas_view
                                 on:keydown=start_camera_move
                                 on:keyup=stop_camera_move
@@ -1452,6 +1680,25 @@ pub fn App() -> impl IntoView {
                                                 edge.path,
                                                 playhead_time.get(),
                                             );
+                                            let prop = ladder_prop_spec(
+                                                &spec,
+                                                edge.path,
+                                                playhead_time.get(),
+                                            );
+                                            let start_marker = ladder_prop_marker_view(
+                                                &prop,
+                                                start_x,
+                                                start_y,
+                                                1.4,
+                                                "edge-endpoint",
+                                            );
+                                            let end_marker = ladder_prop_marker_view(
+                                                &prop,
+                                                end_x,
+                                                end_y,
+                                                1.4,
+                                                "edge-endpoint",
+                                            );
                                             view! {
                                                 <g
                                                     class=if selected { "ladder-item selected" } else { "ladder-item" }
@@ -1476,8 +1723,8 @@ pub fn App() -> impl IntoView {
                                                         .map(ladder_edge_shape_view)
                                                         .collect::<Vec<_>>()
                                                     }
-                                                    <circle class="edge-endpoint" cx=start_x cy=start_y r="1.4" />
-                                                    <circle class="edge-endpoint" cx=end_x cy=end_y r="1.4" />
+                                                    {start_marker}
+                                                    {end_marker}
                                                 </g>
                                             }
                                         })
@@ -1515,6 +1762,17 @@ pub fn App() -> impl IntoView {
                                                 transition.path,
                                                 playhead_time.get(),
                                             );
+                                            let marker = ladder_prop_marker_view(
+                                                &ladder_prop_spec(
+                                                    &spec,
+                                                    transition.path,
+                                                    playhead_time.get(),
+                                                ),
+                                                x,
+                                                y,
+                                                2.15,
+                                                "ladder-prop-marker",
+                                            );
                                             view! {
                                                 <g
                                                     class=class_name
@@ -1528,7 +1786,7 @@ pub fn App() -> impl IntoView {
                                                     }
                                                 >
                                                     <circle class="ladder-node-hitbox" cx=x cy=y r="3.2" />
-                                                    <circle cx=x cy=y r="2.15" />
+                                                    {marker}
                                                 </g>
                                             }
                                         })
@@ -1929,6 +2187,10 @@ pub fn App() -> impl IntoView {
                                         set_define_prop_dialog.update(|dialog| {
                                             if let Some(dialog) = dialog {
                                                 dialog.prop_type = value;
+                                                if dialog.prop_type == "image" && dialog.image_source.is_empty() {
+                                                    dialog.image_source = "ball.png".to_string();
+                                                    dialog.image_width = 10.0;
+                                                }
                                             }
                                         });
                                     }
@@ -1938,10 +2200,14 @@ pub fn App() -> impl IntoView {
                                     <option value="image">"image"</option>
                                     <option value="square">"square"</option>
                                 </select>
-                                <label for="prop-mod">"Modifier"</label>
+                                <label
+                                    for="prop-mod"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "dialog-field-hidden" } else { "" }
+                                >"Modifier"</label>
                                 <input
                                     id="prop-mod"
                                     type="text"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "dialog-field-hidden" } else { "" }
                                     prop:value=move || {
                                         define_prop_dialog
                                             .get()
@@ -1955,6 +2221,58 @@ pub fn App() -> impl IntoView {
                                                 dialog.prop_mod = non_empty_trimmed(&value);
                                             }
                                         });
+                                    }
+                                />
+                                <label
+                                    for="prop-image-source"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "" } else { "dialog-field-hidden" }
+                                >"Image source"</label>
+                                <input
+                                    id="prop-image-source"
+                                    type="text"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "" } else { "dialog-field-hidden" }
+                                    prop:value=move || define_prop_dialog.get().map(|dialog| decode_image_source_from_modifier(&dialog.image_source)).unwrap_or_default()
+                                    on:input=move |ev| {
+                                        let value = encode_image_source_for_modifier(&event_target_value(&ev));
+                                        set_define_prop_dialog.update(|dialog| {
+                                            if let Some(dialog) = dialog {
+                                                dialog.image_source = value;
+                                            }
+                                        });
+                                    }
+                                />
+                                <label
+                                    for="prop-image-file"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "" } else { "dialog-field-hidden" }
+                                >"Custom image"</label>
+                                <input
+                                    id="prop-image-file"
+                                    type="file"
+                                    accept="image/*"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "" } else { "dialog-field-hidden" }
+                                    on:change=choose_custom_prop_image
+                                />
+                                <label
+                                    for="prop-image-width"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "" } else { "dialog-field-hidden" }
+                                >"Width (cm)"</label>
+                                <input
+                                    id="prop-image-width"
+                                    type="number"
+                                    min="0.1"
+                                    step="0.1"
+                                    class=move || if define_prop_dialog.get().is_some_and(|dialog| dialog.prop_type == "image") { "" } else { "dialog-field-hidden" }
+                                    prop:value=move || define_prop_dialog.get().map(|dialog| dialog.image_width.to_string()).unwrap_or_else(|| "10".to_string())
+                                    on:input=move |ev| {
+                                        if let Ok(value) = event_target_value(&ev).parse::<f64>() {
+                                            if value.is_finite() && value > 0.0 {
+                                                set_define_prop_dialog.update(|dialog| {
+                                                    if let Some(dialog) = dialog {
+                                                        dialog.image_width = value;
+                                                    }
+                                                });
+                                            }
+                                        }
                                     }
                                 />
                             </div>
@@ -2066,6 +2384,227 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn encode_image_source_for_modifier(source: &str) -> String {
+    source.trim().replace(';', "%3B")
+}
+
+fn decode_image_source_from_modifier(source: &str) -> String {
+    source.replace("%3B", ";").replace("%3b", ";")
+}
+
+fn image_prop_modifier(source: &str, width: f64) -> String {
+    format!(
+        "image={};width={}",
+        encode_image_source_for_modifier(&decode_image_source_from_modifier(source)),
+        width.max(0.1)
+    )
+}
+
+fn event_drag_sources(
+    record: &PatternRecord,
+    spec: &AnimationSpec,
+    hit: &canvas::EventEditorHit,
+) -> Result<(Coordinate, MhnJmlEvent), String> {
+    let AnimationKind::Jml(jml) = &spec.kind else {
+        return Err("No event layout available for this pattern".to_string());
+    };
+    let layout = jml
+        .layout
+        .as_ref()
+        .ok_or_else(|| "No physical layout available for this pattern".to_string())?;
+    let image = layout
+        .events
+        .iter()
+        .filter(|event| {
+            event.primary_index == hit.primary_index && event.event.hand == hit.image_hand
+        })
+        .min_by(|left, right| {
+            cyclic_time_distance(left.event.t, hit.event_time, jml.period_secs).total_cmp(
+                &cyclic_time_distance(right.event.t, hit.event_time, jml.period_secs),
+            )
+        })
+        .ok_or_else(|| "Selected event image is no longer available".to_string())?;
+    let xml = record_to_pattern_jml(record)?;
+    let model = MhnJmlPattern::from_jml_xml(&xml)?;
+    let primary = model
+        .events
+        .get(hit.primary_index)
+        .cloned()
+        .ok_or_else(|| "Selected primary event is no longer available".to_string())?;
+    Ok((
+        Coordinate {
+            x: image.event.x,
+            y: image.event.y,
+            z: image.event.z,
+        },
+        primary,
+    ))
+}
+
+fn cyclic_time_distance(left: f64, right: f64, period: f64) -> f64 {
+    if period <= 0.0 {
+        return (left - right).abs();
+    }
+    let delta = (left - right).rem_euclid(period);
+    delta.min(period - delta)
+}
+
+fn event_from_canvas_drag(drag: &EventCanvasDrag, dx: f64, dy: f64) -> Coordinate {
+    const SNAP_CM: f64 = 3.0;
+    let mut image = drag.start_image;
+    match drag.hit.handle {
+        canvas::EventEditHandle::Xz => {
+            if let Some((local_x, local_z)) = solve_screen_basis(
+                dx,
+                dy,
+                drag.hit.local_x_dx,
+                drag.hit.local_x_dy,
+                drag.hit.z_dx,
+                drag.hit.z_dy,
+            ) {
+                image.x += local_x;
+                image.z += local_z;
+                if image.z.abs() < SNAP_CM {
+                    image.z = 0.0;
+                }
+            }
+        }
+        canvas::EventEditHandle::Y => {
+            let length_squared = drag.hit.local_y_dx * drag.hit.local_y_dx
+                + drag.hit.local_y_dy * drag.hit.local_y_dy;
+            if length_squared > 1e-9 {
+                image.y += (dx * drag.hit.local_y_dx + dy * drag.hit.local_y_dy) / length_squared;
+                if image.y.abs() < SNAP_CM {
+                    image.y = 0.0;
+                }
+            }
+        }
+    }
+
+    let mut delta = Coordinate {
+        x: image.x - drag.start_image.x,
+        y: image.y - drag.start_image.y,
+        z: image.z - drag.start_image.z,
+    };
+    if drag.hit.image_hand != drag.start_primary.hand {
+        delta.x = -delta.x;
+    }
+    Coordinate {
+        x: drag.start_primary.x + delta.x,
+        y: drag.start_primary.y + delta.y,
+        z: drag.start_primary.z + delta.z,
+    }
+}
+
+fn event_edit_status(handle: canvas::EventEditHandle, event: Coordinate) -> String {
+    match handle {
+        canvas::EventEditHandle::Xz => {
+            format!("Event x {:.1}, z {:.1} cm", event.x, event.z)
+        }
+        canvas::EventEditHandle::Y => format!("Event y {:.1} cm", event.y),
+    }
+}
+
+fn position_from_canvas_drag(drag: &PositionCanvasDrag, dx: f64, dy: f64) -> BodyPosition {
+    const GRID_SPACING_CM: f64 = 20.0;
+    const SNAP_CM: f64 = 3.0;
+    const ANGLE_HANDLE_CM: f64 = 20.0;
+    const ANGLE_SNAP_RADIANS: f64 = 8.0_f64.to_radians();
+    let mut position = drag.start_position;
+    match drag.hit.handle {
+        canvas::PositionEditHandle::Xy => {
+            if let Some((local_x, local_y)) = solve_screen_basis(
+                dx,
+                dy,
+                drag.hit.local_x_dx,
+                drag.hit.local_x_dy,
+                drag.hit.local_y_dx,
+                drag.hit.local_y_dy,
+            ) {
+                let angle = drag.start_position.angle.to_radians();
+                position.x += local_x * angle.cos() - local_y * angle.sin();
+                position.y += local_x * angle.sin() + local_y * angle.cos();
+                position.x = snap_grid_value(position.x, GRID_SPACING_CM, SNAP_CM);
+                position.y = snap_grid_value(position.y, GRID_SPACING_CM, SNAP_CM);
+            }
+        }
+        canvas::PositionEditHandle::Z => {
+            let length_squared = drag.hit.z_dx * drag.hit.z_dx + drag.hit.z_dy * drag.hit.z_dy;
+            if length_squared > 1e-9 {
+                position.z += (dx * drag.hit.z_dx + dy * drag.hit.z_dy) / length_squared;
+                for target in [0.0, 100.0] {
+                    if (position.z - target).abs() < SNAP_CM {
+                        position.z = target;
+                    }
+                }
+            }
+        }
+        canvas::PositionEditHandle::Angle => {
+            let control_x = -drag.hit.local_y_dx * ANGLE_HANDLE_CM + dx;
+            let control_y = -drag.hit.local_y_dy * ANGLE_HANDLE_CM + dy;
+            if let Some((a, b)) = solve_screen_basis(
+                control_x,
+                control_y,
+                drag.hit.local_x_dx,
+                drag.hit.local_x_dy,
+                drag.hit.local_y_dx,
+                drag.hit.local_y_dy,
+            ) {
+                let mut angle = drag.start_position.angle.to_radians() - (-a).atan2(-b);
+                for cardinal in [
+                    0.0,
+                    std::f64::consts::FRAC_PI_2,
+                    std::f64::consts::PI,
+                    1.5 * std::f64::consts::PI,
+                ] {
+                    if normalized_angle_difference(angle, cardinal) < ANGLE_SNAP_RADIANS / 2.0 {
+                        angle = cardinal;
+                        break;
+                    }
+                }
+                position.angle = angle.to_degrees().rem_euclid(360.0);
+            }
+        }
+    }
+    position
+}
+
+fn solve_screen_basis(dx: f64, dy: f64, ax: f64, ay: f64, bx: f64, by: f64) -> Option<(f64, f64)> {
+    let determinant = ax * by - ay * bx;
+    (determinant.abs() > 1e-9).then(|| {
+        (
+            (by * dx - bx * dy) / determinant,
+            (-ay * dx + ax * dy) / determinant,
+        )
+    })
+}
+
+fn snap_grid_value(value: f64, spacing: f64, threshold: f64) -> f64 {
+    let target = spacing * (value / spacing).round();
+    if (value - target).abs() < threshold {
+        target
+    } else {
+        value
+    }
+}
+
+fn normalized_angle_difference(left: f64, right: f64) -> f64 {
+    ((left - right + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI)
+        .abs()
+}
+
+fn position_edit_status(handle: canvas::PositionEditHandle, position: BodyPosition) -> String {
+    match handle {
+        canvas::PositionEditHandle::Xy => {
+            format!("Position x {:.1}, y {:.1} cm", position.x, position.y)
+        }
+        canvas::PositionEditHandle::Z => format!("Position z {:.1} cm", position.z),
+        canvas::PositionEditHandle::Angle => {
+            format!("Position angle {:.1} degrees", position.angle)
+        }
     }
 }
 
@@ -2181,6 +2720,25 @@ fn edit_ladder_position_spatial_in_record(
     target.z = position.z;
     target.angle = position.angle;
     record_from_edited_jml_model(record, model, "Position spatial edit rejected")
+}
+
+fn edit_ladder_event_spatial_in_record(
+    record: &PatternRecord,
+    event_index: usize,
+    coordinate: Coordinate,
+) -> Result<PatternRecord, String> {
+    let xml = record_to_pattern_jml(record)?;
+    let mut model = MhnJmlPattern::from_jml_xml(&xml)?;
+    let target = model
+        .events
+        .get_mut(event_index)
+        .ok_or_else(|| "Selected ladder event is no longer available".to_string())?;
+    target.x = coordinate.x;
+    target.y = coordinate.y;
+    target.z = coordinate.z;
+    target.calcpos = false;
+    model.rebuild_path_events();
+    record_from_edited_jml_model(record, model, "Event spatial edit rejected")
 }
 
 fn add_ladder_position_in_record(
@@ -3161,14 +3719,80 @@ fn ladder_transition_class(transition: &LadderTransition) -> &'static str {
 }
 
 fn ladder_prop_style(spec: &AnimationSpec, path: usize, time: f64) -> String {
-    let color = match &spec.kind {
+    let color = ladder_prop_spec(spec, path, time)
+        .color
+        .unwrap_or_else(|| "#d8dde6".to_string());
+    format!("--ladder-prop-color: {color};")
+}
+
+fn ladder_prop_spec(spec: &AnimationSpec, path: usize, time: f64) -> PropSpec {
+    match &spec.kind {
         AnimationKind::Jml(jml) => jml
             .prop_for_path_at_time(path, time)
-            .and_then(|prop| prop.color.clone())
-            .unwrap_or_else(|| "#d8dde6".to_string()),
-        AnimationKind::Unavailable(_) => "#d8dde6".to_string(),
-    };
-    format!("--ladder-prop-color: {color};")
+            .cloned()
+            .unwrap_or_else(|| PropSpec::default_for_type("ball")),
+        AnimationKind::Unavailable(_) => PropSpec::default_for_type("ball"),
+    }
+}
+
+fn ladder_prop_marker_view(
+    prop: &PropSpec,
+    x: f64,
+    y: f64,
+    radius: f64,
+    class_name: &'static str,
+) -> AnyView {
+    match &prop.kind {
+        PropKind::Square => view! {
+            <rect
+                class=format!("{class_name} ladder-prop-square")
+                x=x - radius
+                y=y - radius
+                width=2.0 * radius
+                height=2.0 * radius
+            />
+        }
+        .into_any(),
+        PropKind::Ring => view! {
+            <g class=format!("{class_name} ladder-prop-ring")>
+                <circle cx=x cy=y r=radius />
+                <circle class="ladder-prop-ring-hole" cx=x cy=y r=radius * 0.48 />
+            </g>
+        }
+        .into_any(),
+        PropKind::Image => {
+            let source = prop
+                .image_source
+                .as_deref()
+                .map(ladder_image_source_url)
+                .unwrap_or_else(|| "./assets/ball.png".to_string());
+            view! {
+                <image
+                    class=format!("{class_name} ladder-prop-image")
+                    href=source
+                    x=x - radius
+                    y=y - radius
+                    width=2.0 * radius
+                    height=2.0 * radius
+                    preserveAspectRatio="xMidYMid meet"
+                />
+            }
+            .into_any()
+        }
+        PropKind::Ball | PropKind::Unknown(_) => view! {
+            <circle class=class_name cx=x cy=y r=radius />
+        }
+        .into_any(),
+    }
+}
+
+fn ladder_image_source_url(source: &str) -> String {
+    let decoded = source.trim().replace("%3B", ";").replace("%3b", ";");
+    if decoded.contains('/') || decoded.starts_with("data:") || decoded.starts_with("blob:") {
+        decoded
+    } else {
+        format!("./assets/{decoded}")
+    }
 }
 
 fn ladder_position_label(position: &LadderPosition) -> String {
@@ -3237,6 +3861,27 @@ fn selected_ladder_transition(spec: &AnimationSpec, selected_id: &str) -> Option
         .transitions
         .into_iter()
         .find(|transition| transition.id == selected_id)
+}
+
+fn selected_ladder_event_selection(
+    spec: &AnimationSpec,
+    selected_id: &str,
+) -> Option<canvas::EventSelection> {
+    let diagram = ladder_diagram(spec)?;
+    if let Some(event) = diagram.events.iter().find(|event| event.id == selected_id) {
+        return Some(canvas::EventSelection {
+            primary_index: event.event_index,
+            time: event.time,
+        });
+    }
+    diagram
+        .transitions
+        .iter()
+        .find(|transition| transition.id == selected_id)
+        .map(|transition| canvas::EventSelection {
+            primary_index: transition.event_index,
+            time: transition.time,
+        })
 }
 
 fn selected_ladder_position_index(spec: &AnimationSpec, selected_id: &str) -> Option<usize> {
@@ -3317,6 +3962,12 @@ fn selected_ladder_prop_draft(
         .get(prop_number)
         .cloned()
         .unwrap_or_else(|| MhnJmlProp::new("ball", None));
+    let prop_spec = PropSpec::from_jml(&prop.prop_type, prop.modifier.as_deref())
+        .unwrap_or_else(|_| PropSpec::default_for_type(&prop.prop_type));
+    let image_source = prop_spec
+        .image_source
+        .clone()
+        .unwrap_or_else(|| "ball.png".to_string());
 
     Ok(Some(DefinePropDraft {
         path,
@@ -3325,6 +3976,8 @@ fn selected_ladder_prop_draft(
         playback_time: time.rem_euclid(spec.period_secs.max(0.1)),
         prop_type: prop.prop_type.to_ascii_lowercase(),
         prop_mod: prop.modifier,
+        image_source,
+        image_width: prop_spec.diameter.max(0.1),
     }))
 }
 

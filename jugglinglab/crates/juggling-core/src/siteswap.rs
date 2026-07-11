@@ -1,7 +1,6 @@
 use crate::hand_siteswap::process_hss;
 use crate::mhn_body::MhnBody;
 use crate::mhn_hands::MhnHands;
-use crate::util::expand_repeats;
 
 const DWELL_DEFAULT: f64 = 1.3;
 const SQUEEZEBEATS_DEFAULT: f64 = 0.4;
@@ -42,6 +41,7 @@ pub struct ThrowSpec {
     pub target_juggler: usize,
     pub modifier: Option<String>,
     pub hand_fixed: bool,
+    pub sync: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,8 +161,11 @@ pub fn parse_config(config: &str) -> Result<SiteswapSpec, String> {
         .flat_map(|beat| beat.throws.iter())
         .map(|throw| throw.value)
         .sum();
-    let divisor = if sync { beats.len() * 2 } else { beats.len() };
-    let balls = ((total as f64) / (divisor as f64)).round().max(1.0) as usize;
+    let divisor = beats.len();
+    if total as usize % divisor != 0 {
+        return Err("The siteswap pattern does not have an integer average".to_string());
+    }
+    let balls = total as usize / divisor;
     let max_throw = beats
         .iter()
         .flat_map(|beat| beat.throws.iter())
@@ -226,36 +229,241 @@ struct ParsedPattern {
 }
 
 fn parse_siteswap_pattern(pattern: &str) -> Result<ParsedPattern, String> {
-    let expanded = expand_siteswap_repeats(&expand_repeats(pattern))?
-        .trim()
-        .to_string();
-    if expanded.contains('<') {
-        let expanded = expand_passing_star(&expanded)?;
-        let (beats, jugglers) = parse_passing_pattern(&expanded)?;
-        let vanilla_async = beats_are_vanilla_async(&beats);
-        Ok(ParsedPattern {
-            beats,
-            sync: false,
-            jugglers,
-            vanilla_async,
-        })
-    } else if expanded.contains('(') {
-        let expanded = expand_sync_star(&expanded)?;
-        Ok(ParsedPattern {
-            beats: parse_sync_pattern(&expanded)?,
-            sync: true,
-            jugglers: 1,
-            vanilla_async: false,
-        })
-    } else {
-        let beats = parse_async_pattern(&expanded)?;
-        let vanilla_async = beats_are_vanilla_async(&beats);
-        Ok(ParsedPattern {
-            beats,
-            sync: false,
-            jugglers: 1,
-            vanilla_async,
-        })
+    let chars = pattern.trim().chars().collect::<Vec<_>>();
+    let mut state = GrammarState::default();
+    let beats = parse_pattern_fragment(&chars, 0, &mut state)?;
+    let jugglers = state.jugglers.unwrap_or(1);
+    let sync = state.saw_sync && !state.saw_async;
+    let vanilla_async = !state.explicit_switch && !sync && beats_are_vanilla_async(&beats);
+    Ok(ParsedPattern {
+        beats,
+        sync,
+        jugglers,
+        vanilla_async,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct GrammarState {
+    jugglers: Option<usize>,
+    right_on_even: Vec<bool>,
+    hand_fixed: Vec<bool>,
+    saw_sync: bool,
+    saw_async: bool,
+    explicit_switch: bool,
+}
+
+impl GrammarState {
+    fn require_jugglers(&mut self, jugglers: usize) -> Result<(), String> {
+        if let Some(expected) = self.jugglers {
+            if expected != jugglers {
+                return Err("Inconsistent number of jugglers".to_string());
+            }
+        } else {
+            self.jugglers = Some(jugglers);
+            self.right_on_even = vec![true; jugglers];
+            self.hand_fixed = vec![false; jugglers];
+        }
+        Ok(())
+    }
+}
+
+fn parse_pattern_fragment(
+    chars: &[char],
+    base_beat: usize,
+    state: &mut GrammarState,
+) -> Result<Vec<Beat>, String> {
+    let mut beats = Vec::<Beat>::new();
+    let mut pos = 0usize;
+    while pos < chars.len() {
+        match chars[pos] {
+            ch if ch.is_whitespace() => pos += 1,
+            '*' => {
+                if chars[pos + 1..].iter().any(|ch| !ch.is_whitespace()) {
+                    return Err("Switch-repeat '*' must terminate its pattern".to_string());
+                }
+                let mut switched = beats.clone();
+                for beat in &mut switched {
+                    for throw in &mut beat.throws {
+                        throw.hand = opposite_siteswap_hand(throw.hand);
+                        throw.hand_fixed = true;
+                    }
+                }
+                beats.extend(switched);
+                state.explicit_switch = true;
+                break;
+            }
+            '?' => {
+                return Err("Wildcard transitions are not implemented by Juggling Lab".to_string());
+            }
+            '<' => {
+                let close = matching_delimiter(chars, pos, '<', '>')
+                    .ok_or_else(|| "Invalid passing group: missing '>'".to_string())?;
+                let group = chars[pos + 1..close].iter().collect::<String>();
+                let group_beats =
+                    parse_general_passing_group(&group, base_beat + beats.len(), state)?;
+                beats.extend(group_beats);
+                pos = close + 1;
+            }
+            '(' => {
+                let close = matching_delimiter(chars, pos, '(', ')')
+                    .ok_or_else(|| "Invalid grouped pattern: missing ')'".to_string())?;
+                let inner = &chars[pos + 1..close];
+                if let Some((body_end, repeats)) = grouped_repeat(inner) {
+                    for _ in 0..repeats {
+                        let nested = parse_pattern_fragment(
+                            &inner[..body_end],
+                            base_beat + beats.len(),
+                            state,
+                        )?;
+                        beats.extend(nested);
+                    }
+                    pos = close + 1;
+                } else {
+                    state.require_jugglers(1)?;
+                    let group = inner.iter().collect::<String>();
+                    let slots = split_top_level(&group, ',');
+                    if slots.len() != 2 {
+                        return Err(format!("Invalid synchronous group: ({group})"));
+                    }
+                    let mut throws = parse_sync_slot(slots[0].trim(), Hand::Left)?;
+                    throws.extend(parse_sync_slot(slots[1].trim(), Hand::Right)?);
+                    state.saw_sync = true;
+                    beats.push(Beat { throws });
+                    pos = close + 1;
+                    if chars.get(pos) == Some(&'!') {
+                        pos += 1;
+                    } else {
+                        beats.push(Beat { throws: Vec::new() });
+                    }
+                }
+            }
+            '[' => {
+                state.require_jugglers(1)?;
+                let close = matching_delimiter(chars, pos, '[', ']')
+                    .ok_or_else(|| "Invalid multiplex: missing ']'".to_string())?;
+                let beat_number = base_beat + beats.len();
+                let hand = hand_for_async_beat(beat_number, state.right_on_even[0]);
+                let context = ThrowContext::new(1, 1, hand, state.hand_fixed[0]);
+                let throws = parse_multiplex_slice(&chars[pos + 1..close], context)?;
+                state.saw_async = true;
+                beats.push(Beat { throws });
+                pos = close + 1;
+            }
+            'L' | 'R' => {
+                state.require_jugglers(1)?;
+                let beat_number = base_beat + beats.len();
+                let left = chars[pos] == 'L';
+                state.right_on_even[0] = if beat_number % 2 == 0 { !left } else { left };
+                state.hand_fixed[0] = true;
+                pos += 1;
+            }
+            ch if is_throw_value_start(ch) => {
+                state.require_jugglers(1)?;
+                let beat_number = base_beat + beats.len();
+                let hand = hand_for_async_beat(beat_number, state.right_on_even[0]);
+                let context = ThrowContext::new(1, 1, hand, state.hand_fixed[0]);
+                let throw = parse_throw_from_slice(chars, &mut pos, context)?;
+                state.saw_async = true;
+                beats.push(Beat {
+                    throws: vec![throw],
+                });
+            }
+            ch => return Err(format!("Unexpected character in siteswap: {ch}")),
+        }
+    }
+    Ok(beats)
+}
+
+fn parse_general_passing_group(
+    group: &str,
+    global_beat: usize,
+    state: &mut GrammarState,
+) -> Result<Vec<Beat>, String> {
+    let parts = split_top_level(group, '|');
+    if parts.is_empty() {
+        return Err("Passing group contains no jugglers".to_string());
+    }
+    state.require_jugglers(parts.len())?;
+    let mut parsed_parts = Vec::with_capacity(parts.len());
+    let mut group_beats = None;
+    for (juggler_index, part) in parts.iter().enumerate() {
+        let parsed = parse_passing_throws(
+            part,
+            juggler_index + 1,
+            global_beat,
+            &mut state.right_on_even,
+            &mut state.hand_fixed,
+        )?;
+        if group_beats.is_some_and(|expected| expected != parsed.beats) {
+            return Err("Inconsistent number of beats between jugglers".to_string());
+        }
+        group_beats = Some(parsed.beats);
+        parsed_parts.push(parsed);
+    }
+
+    let mut beats = vec![Beat { throws: Vec::new() }; group_beats.unwrap_or(0)];
+    for parsed in parsed_parts {
+        for entry in parsed.entries {
+            if let Some(beat) = beats.get_mut(entry.beat_offset) {
+                beat.throws.extend(entry.throws);
+            }
+        }
+    }
+    for throw in beats.iter().flat_map(|beat| &beat.throws) {
+        if throw.sync {
+            state.saw_sync = true;
+        } else {
+            state.saw_async = true;
+        }
+    }
+    Ok(beats)
+}
+
+fn parse_multiplex_slice(chars: &[char], context: ThrowContext) -> Result<Vec<ThrowSpec>, String> {
+    let mut throws = Vec::new();
+    let mut pos = 0usize;
+    while pos < chars.len() {
+        if chars[pos].is_whitespace() {
+            pos += 1;
+            continue;
+        }
+        if !is_throw_value_start(chars[pos]) {
+            return Err(format!("Unexpected character in multiplex: {}", chars[pos]));
+        }
+        throws.push(parse_throw_from_slice(chars, &mut pos, context)?);
+    }
+    if throws.is_empty() {
+        return Err("A multiplex must contain at least one throw".to_string());
+    }
+    Ok(throws)
+}
+
+fn parse_throw_from_slice(
+    chars: &[char],
+    pos: &mut usize,
+    context: ThrowContext,
+) -> Result<ThrowSpec, String> {
+    let first = chars[*pos];
+    let mut tail = chars[*pos + 1..].iter().copied().peekable();
+    let parsed = parse_throw_starting_with(first, &mut tail, context)?;
+    let consumed_tail = chars[*pos + 1..].len() - tail.count();
+    *pos += consumed_tail + 1;
+    Ok(parsed)
+}
+
+fn is_throw_value_start(ch: char) -> bool {
+    ch.is_ascii_digit()
+        || ch == '{'
+        || ch == 'x'
+        || ch == 'p'
+        || matches!(ch, 'a'..='q' | 'r'..='w' | 'y' | 'z')
+}
+
+fn opposite_siteswap_hand(hand: Hand) -> Hand {
+    match hand {
+        Hand::Left => Hand::Right,
+        Hand::Right => Hand::Left,
     }
 }
 
@@ -267,90 +475,11 @@ fn beats_are_vanilla_async(beats: &[Beat]) -> bool {
     })
 }
 
-fn parse_async_pattern(pattern: &str) -> Result<Vec<Beat>, String> {
-    let mut beats = Vec::new();
-    let mut chars = pattern.chars().peekable();
-    let mut beat_index = 0usize;
-
-    while let Some(ch) = chars.next() {
-        if ch.is_whitespace() || ch == ',' || ch == '.' {
-            continue;
-        }
-
-        let hand = if beat_index % 2 == 0 {
-            Hand::Right
-        } else {
-            Hand::Left
-        };
-
-        if ch == '[' {
-            let mut throws = Vec::new();
-            while let Some(inner) = chars.next() {
-                if inner == ']' {
-                    break;
-                }
-                if inner.is_whitespace() || inner == ',' {
-                    continue;
-                }
-                throws.push(parse_throw_starting_with(
-                    inner,
-                    &mut chars,
-                    ThrowContext::new(1, 1, hand, false),
-                )?);
-            }
-            beats.push(Beat { throws });
-            beat_index += 1;
-        } else {
-            beats.push(Beat {
-                throws: vec![parse_throw_starting_with(
-                    ch,
-                    &mut chars,
-                    ThrowContext::new(1, 1, hand, false),
-                )?],
-            });
-            beat_index += 1;
-        }
-    }
-
-    Ok(beats)
-}
-
-fn parse_sync_pattern(pattern: &str) -> Result<Vec<Beat>, String> {
-    let mut beats = Vec::new();
-    let mut chars = pattern.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch != '(' {
-            continue;
-        }
-
-        let mut group = String::new();
-        for inner in chars.by_ref() {
-            if inner == ')' {
-                break;
-            }
-            group.push(inner);
-        }
-
-        let parts: Vec<&str> = group.split(',').collect();
-        if parts.len() < 2 {
-            return Err(format!("Invalid synchronous group: ({group})"));
-        }
-
-        let mut throws = Vec::new();
-        for (idx, part) in parts.iter().take(2).enumerate() {
-            let hand = if idx == 0 { Hand::Left } else { Hand::Right };
-            throws.extend(parse_sync_slot(part.trim(), hand)?);
-        }
-        beats.push(Beat { throws });
-    }
-
-    Ok(beats)
-}
-
 fn parse_sync_slot(slot: &str, hand: Hand) -> Result<Vec<ThrowSpec>, String> {
     if slot.is_empty() || slot == "-" {
-        return Ok(vec![throw_spec(0, hand, false, 1, 1, None, true)]);
+        let mut zero = throw_spec(0, hand, false, 1, 1, None, true);
+        zero.sync = true;
+        return Ok(vec![zero]);
     }
 
     if slot.starts_with('[') && slot.ends_with(']') {
@@ -363,7 +492,7 @@ fn parse_sync_slot(slot: &str, hand: Hand) -> Result<Vec<ThrowSpec>, String> {
             throws.push(parse_throw_starting_with(
                 ch,
                 &mut chars,
-                ThrowContext::new(1, 1, hand, true),
+                ThrowContext::new(1, 1, hand, true).with_sync(true),
             )?);
         }
         return Ok(throws);
@@ -376,7 +505,7 @@ fn parse_sync_slot(slot: &str, hand: Hand) -> Result<Vec<ThrowSpec>, String> {
     Ok(vec![parse_throw_starting_with(
         first,
         &mut chars,
-        ThrowContext::new(1, 1, hand, true),
+        ThrowContext::new(1, 1, hand, true).with_sync(true),
     )?])
 }
 
@@ -386,6 +515,8 @@ struct ThrowContext {
     default_target_juggler: usize,
     hand: Hand,
     hand_fixed: bool,
+    sync: bool,
+    allow_pass: bool,
 }
 
 impl ThrowContext {
@@ -400,7 +531,19 @@ impl ThrowContext {
             default_target_juggler,
             hand,
             hand_fixed,
+            sync: false,
+            allow_pass: false,
         }
+    }
+
+    fn with_sync(mut self, sync: bool) -> Self {
+        self.sync = sync;
+        self
+    }
+
+    fn with_passing(mut self) -> Self {
+        self.allow_pass = true;
+        self
     }
 }
 
@@ -436,12 +579,12 @@ where
     let mut target_juggler = context.default_target_juggler;
     let mut modifier = None;
 
-    while matches!(chars.peek(), Some('x') | Some('X')) {
+    if chars.peek() == Some(&'x') {
         chars.next();
-        cross = !cross;
+        cross = true;
     }
 
-    if matches!(chars.peek(), Some('p') | Some('P')) {
+    if context.allow_pass && chars.peek() == Some(&'p') {
         chars.next();
         target_juggler = context.source_juggler + 1;
         let mut digits = String::new();
@@ -455,22 +598,21 @@ where
         }
     }
 
-    if chars.peek() == Some(&'/') {
-        chars.next();
-    }
-
     let mut modifier_text = String::new();
-    while chars
-        .peek()
-        .is_some_and(|ch| matches!(ch, 'B' | 'H' | 'F' | 'L' | 'T'))
-    {
+    if chars.peek().is_some_and(|ch| is_modifier_start(*ch)) {
         modifier_text.push(chars.next().expect("peeked modifier exists"));
+        while chars.peek().is_some_and(|ch| ch.is_ascii_uppercase()) {
+            modifier_text.push(chars.next().expect("peeked modifier exists"));
+        }
     }
     if !modifier_text.is_empty() {
         modifier = Some(modifier_text);
     }
+    if chars.peek() == Some(&'/') {
+        chars.next();
+    }
 
-    Ok(throw_spec(
+    let mut parsed = throw_spec(
         value,
         context.hand,
         cross,
@@ -478,7 +620,13 @@ where
         target_juggler,
         modifier,
         context.hand_fixed,
-    ))
+    );
+    parsed.sync = context.sync;
+    Ok(parsed)
+}
+
+fn is_modifier_start(ch: char) -> bool {
+    ch.is_ascii_uppercase() && !matches!(ch, 'L' | 'R')
 }
 
 fn throw_spec(
@@ -498,71 +646,8 @@ fn throw_spec(
         target_juggler,
         modifier,
         hand_fixed,
+        sync: false,
     }
-}
-
-fn parse_passing_pattern(pattern: &str) -> Result<(Vec<Beat>, usize), String> {
-    let groups = passing_groups(pattern)?;
-    if groups.is_empty() {
-        return Err("The passing siteswap contains no groups".to_string());
-    }
-
-    let mut beats = Vec::<Beat>::new();
-    let mut jugglers = None;
-    let mut right_on_even = Vec::<bool>::new();
-    let mut hand_fixed = Vec::<bool>::new();
-    let mut current_beat = 0usize;
-
-    for group in groups {
-        let parts = split_top_level(&group, '|');
-        if parts.is_empty() {
-            continue;
-        }
-
-        let group_jugglers = parts.len();
-        if let Some(expected) = jugglers {
-            if expected != group_jugglers {
-                return Err("Inconsistent number of jugglers in passing pattern".to_string());
-            }
-        } else {
-            jugglers = Some(group_jugglers);
-            right_on_even = vec![true; group_jugglers];
-            hand_fixed = vec![false; group_jugglers];
-        }
-
-        let mut parsed_parts = Vec::with_capacity(group_jugglers);
-        let mut group_beats = None;
-        for (juggler_index, part) in parts.iter().enumerate() {
-            let parsed = parse_passing_throws(
-                part,
-                juggler_index + 1,
-                current_beat,
-                &mut right_on_even,
-                &mut hand_fixed,
-            )?;
-            if let Some(expected) = group_beats {
-                if parsed.beats != expected {
-                    return Err("Inconsistent number of beats between jugglers".to_string());
-                }
-            } else {
-                group_beats = Some(parsed.beats);
-            }
-            parsed_parts.push(parsed);
-        }
-
-        let group_beats = group_beats.unwrap_or(0);
-        ensure_beat_capacity(&mut beats, current_beat + group_beats);
-        for parsed in parsed_parts {
-            for entry in parsed.entries {
-                let beat_index = current_beat + entry.beat_offset;
-                ensure_beat_capacity(&mut beats, beat_index + 1);
-                beats[beat_index].throws.extend(entry.throws);
-            }
-        }
-        current_beat += group_beats;
-    }
-
-    Ok((beats, jugglers.unwrap_or(1)))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -619,11 +704,13 @@ fn parse_passing_throws(
                     source_juggler,
                     Hand::Left,
                     true,
+                    true,
                 )?);
                 throws.extend(parse_throw_slot_for_passing(
                     parts[1].trim(),
                     source_juggler,
                     Hand::Right,
+                    true,
                     true,
                 )?);
                 entries.push(PassingEntry {
@@ -649,6 +736,7 @@ fn parse_passing_throws(
                     source_juggler,
                     hand,
                     hand_fixed[source_juggler - 1],
+                    false,
                 )?;
                 entries.push(PassingEntry {
                     beat_offset: beat_sub,
@@ -675,7 +763,8 @@ fn parse_passing_throws(
                         source_juggler,
                         hand,
                         hand_fixed[source_juggler - 1],
-                    ),
+                    )
+                    .with_passing(),
                 )?;
                 let consumed_tail = chars[pos + 1..].len() - tail.clone().count();
                 entries.push(PassingEntry {
@@ -699,17 +788,12 @@ fn parse_throw_slot_for_passing(
     source_juggler: usize,
     hand: Hand,
     hand_fixed: bool,
+    sync: bool,
 ) -> Result<Vec<ThrowSpec>, String> {
     if slot.is_empty() || slot == "-" {
-        return Ok(vec![throw_spec(
-            0,
-            hand,
-            false,
-            source_juggler,
-            source_juggler,
-            None,
-            true,
-        )]);
+        let mut zero = throw_spec(0, hand, false, source_juggler, source_juggler, None, true);
+        zero.sync = sync;
+        return Ok(vec![zero]);
     }
 
     let inner = slot
@@ -724,150 +808,12 @@ fn parse_throw_slot_for_passing(
         throws.push(parse_throw_starting_with(
             ch,
             &mut chars,
-            ThrowContext::new(source_juggler, source_juggler, hand, hand_fixed),
+            ThrowContext::new(source_juggler, source_juggler, hand, hand_fixed)
+                .with_sync(sync)
+                .with_passing(),
         )?);
     }
     Ok(throws)
-}
-
-fn passing_groups(pattern: &str) -> Result<Vec<String>, String> {
-    let chars = pattern.chars().collect::<Vec<_>>();
-    let mut groups = Vec::new();
-    let mut pos = 0usize;
-    while pos < chars.len() {
-        match chars[pos] {
-            ch if ch.is_whitespace() || ch == ',' || ch == '.' || ch == '*' => pos += 1,
-            '<' => {
-                let close = matching_delimiter(&chars, pos, '<', '>')
-                    .ok_or_else(|| "Invalid passing group: missing '>'".to_string())?;
-                groups.push(chars[pos + 1..close].iter().collect());
-                pos = close + 1;
-            }
-            '(' => {
-                let close = matching_delimiter(&chars, pos, '(', ')')
-                    .ok_or_else(|| "Invalid grouped passing pattern: missing ')'".to_string())?;
-                let inner = chars[pos + 1..close].iter().collect::<String>();
-                groups.extend(passing_groups(&inner)?);
-                pos = close + 1;
-            }
-            ch => return Err(format!("Unexpected character in passing siteswap: {ch}")),
-        }
-    }
-    Ok(groups)
-}
-
-fn expand_passing_star(input: &str) -> Result<String, String> {
-    let trimmed = input.trim();
-    let Some(base) = trimmed.strip_suffix('*') else {
-        return Ok(trimmed.to_string());
-    };
-
-    let base = base.trim();
-    let mirrored = passing_groups(base)?
-        .into_iter()
-        .map(|group| {
-            mirror_passing_group(&group).map(|mirrored_group| format!("<{mirrored_group}>"))
-        })
-        .collect::<Result<String, String>>()?;
-
-    Ok(format!("{base}{mirrored}"))
-}
-
-fn mirror_passing_group(group: &str) -> Result<String, String> {
-    split_top_level(group, '|')
-        .into_iter()
-        .map(|part| mirror_passing_part(&part))
-        .collect::<Result<Vec<_>, _>>()
-        .map(|parts| parts.join("|"))
-}
-
-fn mirror_passing_part(part: &str) -> Result<String, String> {
-    let chars = part.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut pos = 0usize;
-
-    while pos < chars.len() {
-        match chars[pos] {
-            '(' => {
-                let close = matching_delimiter(&chars, pos, '(', ')')
-                    .ok_or_else(|| "Invalid passing synchronous group: missing ')'".to_string())?;
-                let group = chars[pos + 1..close].iter().collect::<String>();
-                let slots = split_top_level(&group, ',');
-                if slots.len() < 2 {
-                    return Err(format!("Invalid passing synchronous group: ({group})"));
-                }
-
-                output.push('(');
-                output.push_str(slots[1].trim());
-                output.push(',');
-                output.push_str(slots[0].trim());
-                for extra in slots.iter().skip(2) {
-                    output.push(',');
-                    output.push_str(extra.trim());
-                }
-                output.push(')');
-                pos = close + 1;
-            }
-            'R' => {
-                output.push('L');
-                pos += 1;
-            }
-            'L' => {
-                output.push('R');
-                pos += 1;
-            }
-            'r' => {
-                output.push('l');
-                pos += 1;
-            }
-            'l' => {
-                output.push('r');
-                pos += 1;
-            }
-            ch => {
-                output.push(ch);
-                pos += 1;
-            }
-        }
-    }
-
-    Ok(output)
-}
-
-fn expand_siteswap_repeats(input: &str) -> Result<String, String> {
-    let chars = input.chars().collect::<Vec<_>>();
-    expand_siteswap_repeats_in_chars(&chars)
-}
-
-fn expand_siteswap_repeats_in_chars(chars: &[char]) -> Result<String, String> {
-    let mut output = String::new();
-    let mut pos = 0usize;
-
-    while pos < chars.len() {
-        if chars[pos] != '(' {
-            output.push(chars[pos]);
-            pos += 1;
-            continue;
-        }
-
-        let Some(close) = matching_delimiter(chars, pos, '(', ')') else {
-            return Err("Invalid grouped pattern: missing ')'".to_string());
-        };
-        let inner = &chars[pos + 1..close];
-        if let Some((body_end, repeats)) = grouped_repeat(inner) {
-            let body = expand_siteswap_repeats_in_chars(&inner[..body_end])?;
-            for _ in 0..repeats {
-                output.push_str(&body);
-            }
-        } else {
-            output.push('(');
-            output.push_str(&expand_siteswap_repeats_in_chars(inner)?);
-            output.push(')');
-        }
-        pos = close + 1;
-    }
-
-    Ok(output)
 }
 
 fn grouped_repeat(chars: &[char]) -> Option<(usize, usize)> {
@@ -892,50 +838,6 @@ fn grouped_repeat(chars: &[char]) -> Option<(usize, usize)> {
         body_end -= 1;
     }
     Some((body_end, repeats))
-}
-
-fn expand_sync_star(input: &str) -> Result<String, String> {
-    let trimmed = input.trim();
-    let Some(base) = trimmed.strip_suffix('*') else {
-        return Ok(trimmed.to_string());
-    };
-    let mirrored = mirror_sync_groups(base.trim())?;
-    Ok(format!("{}{mirrored}", base.trim()))
-}
-
-fn mirror_sync_groups(input: &str) -> Result<String, String> {
-    let chars = input.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut pos = 0usize;
-
-    while pos < chars.len() {
-        if chars[pos].is_whitespace() {
-            pos += 1;
-            continue;
-        }
-        if chars[pos] != '(' {
-            return Err(format!(
-                "Invalid synchronous starred pattern near '{}'",
-                chars[pos]
-            ));
-        }
-
-        let close = matching_delimiter(&chars, pos, '(', ')')
-            .ok_or_else(|| "Invalid synchronous starred pattern: missing ')'".to_string())?;
-        let group = chars[pos + 1..close].iter().collect::<String>();
-        let parts = split_top_level(&group, ',');
-        if parts.len() < 2 {
-            return Err(format!("Invalid synchronous group: ({group})"));
-        }
-        output.push('(');
-        output.push_str(parts[1].trim());
-        output.push(',');
-        output.push_str(parts[0].trim());
-        output.push(')');
-        pos = close + 1;
-    }
-
-    Ok(output)
 }
 
 fn split_top_level(input: &str, delimiter: char) -> Vec<String> {
@@ -1007,12 +909,6 @@ fn matching_delimiter(chars: &[char], open_pos: usize, open: char, close: char) 
     None
 }
 
-fn ensure_beat_capacity(beats: &mut Vec<Beat>, len: usize) {
-    while beats.len() < len {
-        beats.push(Beat { throws: Vec::new() });
-    }
-}
-
 fn hand_for_async_beat(beat: usize, right_on_even: bool) -> Hand {
     let right = if beat % 2 == 0 {
         right_on_even
@@ -1025,19 +921,16 @@ fn hand_for_async_beat(beat: usize, right_on_even: bool) -> Hand {
 fn throw_value(ch: char) -> Option<u32> {
     if ch.is_ascii_digit() {
         ch.to_digit(10)
-    } else if ch.is_ascii_alphabetic() {
-        Some(ch.to_ascii_lowercase() as u32 - 'a' as u32 + 10)
+    } else if ch.is_ascii_lowercase() {
+        Some(ch as u32 - 'a' as u32 + 10)
     } else {
         None
     }
 }
 
 pub fn target_hand(spec: &SiteswapSpec, start: Hand, value: u32, cross: bool) -> Hand {
-    let toggles = if spec.sync {
-        cross
-    } else {
-        (value % 2 == 1) ^ cross
-    };
+    let _ = spec;
+    let toggles = (value % 2 == 1) ^ cross;
     if toggles {
         match start {
             Hand::Left => Hand::Right,
@@ -1075,7 +968,7 @@ mod tests {
     fn parses_sync_siteswap() {
         let spec = parse_config("pattern=(4x,2)(2,4x);title=Chops").unwrap();
         assert!(spec.sync);
-        assert_eq!(spec.beats.len(), 2);
+        assert_eq!(spec.beats.len(), 4);
         assert_eq!(display_title(&spec), "Chops");
     }
 
@@ -1083,7 +976,7 @@ mod tests {
     fn parses_synchronous_star_as_mirrored_half() {
         let spec = parse_config("pattern=(2,6x)(2x,6)*;colors=orbits").unwrap();
         assert!(spec.sync);
-        assert_eq!(spec.beats.len(), 4);
+        assert_eq!(spec.beats.len(), 8);
         assert_eq!(spec.balls, 4);
         assert_eq!(target_hand(&spec, Hand::Right, 6, true), Hand::Left);
     }
@@ -1132,7 +1025,7 @@ mod tests {
 
     #[test]
     fn parses_passing_targets_and_bounce_modifiers() {
-        let spec = parse_config("pattern=<3p|3p2><3BHL|0>").unwrap();
+        let spec = parse_config("pattern=<3p|3p2><3BHL|1>").unwrap();
         assert_eq!(spec.jugglers, 2);
         assert_eq!(spec.beats.len(), 2);
         assert_eq!(spec.beats[0].throws[0].target_juggler, 2);
@@ -1202,5 +1095,69 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn matches_original_siteswap_pattern_grammar_cases() {
+        use crate::layout::LaidoutPattern;
+        use crate::mhn_matrix::MhnMatrix;
+
+        let cases = [
+            ("868671", 1, 6),
+            ("(4,3x)!(2,0)!(3x,0)!", 1, 4),
+            ("(0,6x)!(0,0)!(6x,0)!(0,0)!", 1, 3),
+            ("4x1(4x,3x)*", 1, 3),
+            ("([42],4x)*", 1, 5),
+            ("(645^2)65x6x1x((6x,4)*^2)(7,5x)(4,1x)!", 1, 5),
+            (
+                "<([2xp/2x],[2xp/2])|(2,[2/2xp])><(2,[2p/2])|([2/2p],[2/2p])>",
+                2,
+                7,
+            ),
+            ("{49}1", 1, 25),
+            ("3BB", 1, 3),
+            ("R3R3xL3L3x", 1, 3),
+            ("<R|L><4xp|3><3|4xp>", 2, 7),
+            ("(4,5x)(4,1x)!R5x41x", 1, 4),
+            ("0", 1, 0),
+            ("<0|0>", 2, 0),
+            ("[53] 22", 1, 4),
+            ("[5 3  ] 2 2 ", 1, 4),
+            (" (2,4x) ([4x 4] , 2) ", 1, 4),
+            ("{5}{1}", 1, 3),
+            ("5{1}", 1, 3),
+            ("{5}1{5}1", 1, 3),
+        ];
+
+        for (pattern, jugglers, paths) in cases {
+            let spec = parse_config(pattern).unwrap_or_else(|err| panic!("{pattern}: {err}"));
+            assert_eq!(spec.jugglers, jugglers, "{pattern}");
+            assert_eq!(spec.balls, paths, "{pattern}");
+            let mut matrix = MhnMatrix::from_siteswap(&spec)
+                .unwrap_or_else(|err| panic!("{pattern}: {err}\n{:#?}", spec.beats));
+            let model = matrix
+                .to_jml_pattern(&spec)
+                .unwrap_or_else(|err| panic!("{pattern}: {err}"));
+            LaidoutPattern::from_jml_pattern(&model)
+                .unwrap_or_else(|err| panic!("{pattern}: {err}"));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_generalized_siteswap_syntax() {
+        for pattern in [
+            "",
+            "(4,4",
+            "[53",
+            "<3|3",
+            "<3|3><3|3|3>",
+            "<3|33>",
+            "3*3",
+            "Q3",
+            "52",
+            "?",
+        ] {
+            assert!(parse_config(pattern).is_err(), "{pattern}");
+        }
     }
 }

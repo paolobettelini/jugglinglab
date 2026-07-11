@@ -11,7 +11,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let public_dir = env::var("JUGGLINGLAB_PUBLIC_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../public"));
+        .unwrap_or_else(|_| {
+            let working_dir_public = env::current_dir().unwrap_or_default().join("public");
+            if working_dir_public.is_dir() {
+                working_dir_public
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../public")
+            }
+        });
     let public_dir = public_dir.canonicalize().unwrap_or(public_dir);
 
     let app = Router::new().fallback_service(

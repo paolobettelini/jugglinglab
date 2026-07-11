@@ -78,11 +78,7 @@ impl MhnMatrix {
                     .fold(1usize, |acc, juggler| lcm(acc, body.get_period(juggler)))
             })
             .unwrap_or(1);
-        let pattern_period = if spec.sync {
-            spec.beats.len() * 2
-        } else {
-            spec.beats.len()
-        };
+        let pattern_period = spec.beats.len();
         let norep_period = lcm(lcm(pattern_period, hands_period), body_period).max(1);
         let odd_period_switchdelay = spec.vanilla_async && !spec.sync && norep_period % 2 == 1;
         let period = if odd_period_switchdelay {
@@ -93,7 +89,7 @@ impl MhnMatrix {
         let max_throw = spec.max_throw as usize;
         let indexes = max_throw + period + 1;
         let max_occupancy = max_occupancy(spec).max(1);
-        let number_of_paths = spec.balls.max(1);
+        let number_of_paths = spec.balls;
         let mut throws =
             vec![vec![vec![vec![None; max_occupancy]; indexes]; 2]; number_of_jugglers];
 
@@ -106,7 +102,7 @@ impl MhnMatrix {
                 let mut slots_by_hand = vec![[0usize; 2]; number_of_jugglers];
                 for throw in &beat.throws {
                     let source_juggler = throw.source_juggler.clamp(1, number_of_jugglers);
-                    let source_hand = source_hand_for_throw(spec, throw, index, switch_hands);
+                    let source_hand = source_hand_for_throw(spec, throw, first_index, switch_hands);
                     let hand_index = hand_to_index(source_hand);
                     let slot = slots_by_hand[source_juggler - 1][hand_index];
                     slots_by_hand[source_juggler - 1][hand_index] += 1;
@@ -131,7 +127,7 @@ impl MhnMatrix {
                     );
                     if let Some(hands) = &spec.hands {
                         let mut hands_beat = index;
-                        if spec.sync && hand_index == RIGHT_HAND {
+                        if throw.sync && hand_index == RIGHT_HAND {
                             hands_beat += 1;
                         }
                         mhn_throw.hands_beat =
@@ -1517,36 +1513,27 @@ fn max_occupancy(spec: &SiteswapSpec) -> usize {
 }
 
 fn indexed_beats_for_period(spec: &SiteswapSpec, period: usize) -> Vec<(usize, usize)> {
-    if spec.sync {
-        (0..period)
-            .step_by(2)
-            .map(|index| (index, (index / 2) % spec.beats.len()))
-            .collect()
-    } else {
-        (0..period)
-            .map(|index| (index, index % spec.beats.len()))
-            .collect()
-    }
+    (0..period)
+        .map(|index| (index, index % spec.beats.len()))
+        .collect()
 }
 
 fn source_hand_for_throw(
-    spec: &SiteswapSpec,
+    _spec: &SiteswapSpec,
     throw: &ThrowSpec,
     index: usize,
     switch_hands: bool,
 ) -> Hand {
-    let hand = if spec.sync || throw.hand_fixed {
-        throw.hand
+    if throw.hand_fixed {
+        if switch_hands {
+            opposite_hand(throw.hand)
+        } else {
+            throw.hand
+        }
     } else if index % 2 == 0 {
         Hand::Right
     } else {
         Hand::Left
-    };
-
-    if switch_hands && (spec.sync || throw.hand_fixed) {
-        opposite_hand(hand)
-    } else {
-        hand
     }
 }
 

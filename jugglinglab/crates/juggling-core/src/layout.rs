@@ -305,6 +305,41 @@ impl LaidoutPattern {
         ))
     }
 
+    pub fn is_hand_holding_path(
+        &self,
+        juggler: usize,
+        hand: usize,
+        time: f64,
+        path: usize,
+    ) -> bool {
+        let Some(links) = path
+            .checked_sub(1)
+            .and_then(|index| self.path_links.get(index))
+        else {
+            return false;
+        };
+        let time = self.loop_time(time);
+        links.iter().any(|link| {
+            let PathLinkKind::InHand {
+                juggler: holding_juggler,
+                hand: holding_hand,
+            } = &link.kind
+            else {
+                return false;
+            };
+            if *holding_juggler != juggler || *holding_hand != hand {
+                return false;
+            }
+            let start_time = self.events[link.start_event_index].event.t;
+            let end_time = self.events[link.end_event_index].event.t;
+            time >= start_time && time <= end_time
+        })
+    }
+
+    pub fn is_hand_holding(&self, juggler: usize, hand: usize, time: f64) -> bool {
+        (1..=self.number_of_paths).any(|path| self.is_hand_holding_path(juggler, hand, time, path))
+    }
+
     pub fn juggler_position(&self, juggler: usize, time: f64) -> Result<Coordinate, String> {
         if juggler == 0 || juggler > self.number_of_jugglers {
             return Err(format!("Juggler {juggler} out of range"));
@@ -2222,6 +2257,32 @@ mod tests {
         assert!(point.x.is_finite());
         assert!(point.y.is_finite());
         assert!(point.z.is_finite());
+    }
+
+    #[test]
+    fn reports_in_hand_segments_for_event_overlays() {
+        let spec = parse_config("pattern=3;bps=3").unwrap();
+        let mut matrix = MhnMatrix::from_siteswap(&spec).unwrap();
+        let model = matrix.to_jml_pattern(&spec).unwrap();
+        let layout = LaidoutPattern::from_jml_pattern(&model).unwrap();
+
+        let samples = (0..100)
+            .map(|sample| {
+                layout.loop_start_time
+                    + (layout.loop_end_time - layout.loop_start_time) * sample as f64 / 100.0
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            samples
+                .iter()
+                .any(|time| layout.is_hand_holding(1, 0, *time))
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|time| !layout.is_hand_holding(1, 0, *time))
+        );
+        assert!(!layout.is_hand_holding_path(1, 0, 0.0, 0));
     }
 
     #[test]

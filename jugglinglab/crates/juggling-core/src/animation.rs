@@ -547,11 +547,13 @@ mod tests {
     fn unsupported_siteswaps_do_not_use_legacy_renderer() {
         for config in ["pattern=510", "pattern=654", "pattern=664"] {
             let record = PatternRecord::siteswap(config, config);
-            let spec = AnimationSpec::from_record(&record).unwrap();
-            assert!(
-                matches!(spec.kind, AnimationKind::Unavailable(_)),
-                "{config} should be marked unavailable instead of rendered as legacy siteswap"
-            );
+            match AnimationSpec::from_record(&record) {
+                Ok(spec) => assert!(
+                    matches!(spec.kind, AnimationKind::Unavailable(_)),
+                    "{config} should be unavailable instead of rendered by a legacy fallback"
+                ),
+                Err(_) => {}
+            }
         }
     }
 
