@@ -4,6 +4,8 @@ use crate::mhn_hands::MhnHands;
 
 const DWELL_DEFAULT: f64 = 1.3;
 const SQUEEZEBEATS_DEFAULT: f64 = 0.4;
+const THROWS_PER_SEC: [f64; 10] = [2.00, 2.00, 2.00, 2.90, 3.40, 4.10, 4.25, 5.00, 5.00, 5.50];
+const SECS_AIRTIME_MAX: f64 = 2.6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SiteswapSpec {
@@ -11,6 +13,7 @@ pub struct SiteswapSpec {
     pub pattern: String,
     pub title: Option<String>,
     pub bps: f64,
+    pub bps_explicit: bool,
     pub dwell: f64,
     pub squeezebeats: f64,
     pub dwell_array: Option<Vec<f64>>,
@@ -23,6 +26,7 @@ pub struct SiteswapSpec {
     pub beats: Vec<Beat>,
     pub sync: bool,
     pub vanilla_async: bool,
+    pub switch_repeat: bool,
     pub balls: usize,
     pub max_throw: u32,
 }
@@ -70,12 +74,11 @@ pub fn parse_config(config: &str) -> Result<SiteswapSpec, String> {
         .map(|(_, value)| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let bps = params
+    let explicit_bps = params
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("bps"))
         .and_then(|(_, value)| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(3.0);
+        .filter(|value| value.is_finite() && *value > 0.0);
     let dwell = params
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("dwell"))
@@ -151,6 +154,7 @@ pub fn parse_config(config: &str) -> Result<SiteswapSpec, String> {
     let sync = parsed_pattern.sync;
     let jugglers = parsed_pattern.jugglers;
     let vanilla_async = parsed_pattern.vanilla_async;
+    let switch_repeat = parsed_pattern.switch_repeat;
 
     if beats.is_empty() {
         return Err("The siteswap pattern contains no readable throws".to_string());
@@ -172,12 +176,15 @@ pub fn parse_config(config: &str) -> Result<SiteswapSpec, String> {
         .map(|throw| throw.value)
         .max()
         .unwrap_or(3);
+    let bps_explicit = explicit_bps.is_some();
+    let bps = explicit_bps.unwrap_or_else(|| calculate_default_bps(&beats, dwell));
 
     Ok(SiteswapSpec {
         raw_config: config.to_string(),
         pattern,
         title,
         bps,
+        bps_explicit,
         dwell,
         squeezebeats,
         dwell_array,
@@ -190,9 +197,32 @@ pub fn parse_config(config: &str) -> Result<SiteswapSpec, String> {
         beats,
         sync,
         vanilla_async,
+        switch_repeat,
         balls,
         max_throw,
     })
+}
+
+fn calculate_default_bps(beats: &[Beat], dwell: f64) -> f64 {
+    let mut throws_per_second = 0.0;
+    let mut number_averaged = 0usize;
+    let mut max_throw = 0u32;
+
+    for throw in beats.iter().flat_map(|beat| &beat.throws) {
+        if throw.value > 2 {
+            throws_per_second += THROWS_PER_SEC[throw.value.min(9) as usize];
+            number_averaged += 1;
+        }
+        max_throw = max_throw.max(throw.value);
+    }
+
+    let average = if number_averaged > 0 {
+        throws_per_second / number_averaged as f64
+    } else {
+        2.0
+    };
+    let maximum_flight = (max_throw as f64 - dwell) / SECS_AIRTIME_MAX;
+    average.max(maximum_flight)
 }
 
 pub fn display_title(spec: &SiteswapSpec) -> String {
@@ -226,21 +256,31 @@ struct ParsedPattern {
     sync: bool,
     jugglers: usize,
     vanilla_async: bool,
+    switch_repeat: bool,
 }
 
 fn parse_siteswap_pattern(pattern: &str) -> Result<ParsedPattern, String> {
     let chars = pattern.trim().chars().collect::<Vec<_>>();
     let mut state = GrammarState::default();
-    let beats = parse_pattern_fragment(&chars, 0, &mut state)?;
+    let fragment = parse_pattern_fragment(&chars, 0, &mut state)?;
+    let switch_repeat = fragment.switch_repeat;
+    let beats = fragment.beats;
     let jugglers = state.jugglers.unwrap_or(1);
     let sync = state.saw_sync && !state.saw_async;
-    let vanilla_async = !state.explicit_switch && !sync && beats_are_vanilla_async(&beats);
+    let vanilla_async = !switch_repeat && !state.non_vanilla_async;
     Ok(ParsedPattern {
         beats,
         sync,
         jugglers,
         vanilla_async,
+        switch_repeat,
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PatternFragment {
+    beats: Vec<Beat>,
+    switch_repeat: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -250,7 +290,7 @@ struct GrammarState {
     hand_fixed: Vec<bool>,
     saw_sync: bool,
     saw_async: bool,
-    explicit_switch: bool,
+    non_vanilla_async: bool,
 }
 
 impl GrammarState {
@@ -272,8 +312,9 @@ fn parse_pattern_fragment(
     chars: &[char],
     base_beat: usize,
     state: &mut GrammarState,
-) -> Result<Vec<Beat>, String> {
+) -> Result<PatternFragment, String> {
     let mut beats = Vec::<Beat>::new();
+    let mut switch_repeat = false;
     let mut pos = 0usize;
     while pos < chars.len() {
         match chars[pos] {
@@ -290,7 +331,7 @@ fn parse_pattern_fragment(
                     }
                 }
                 beats.extend(switched);
-                state.explicit_switch = true;
+                switch_repeat = true;
                 break;
             }
             '?' => {
@@ -316,7 +357,7 @@ fn parse_pattern_fragment(
                             base_beat + beats.len(),
                             state,
                         )?;
-                        beats.extend(nested);
+                        beats.extend(nested.beats);
                     }
                     pos = close + 1;
                 } else {
@@ -329,6 +370,7 @@ fn parse_pattern_fragment(
                     let mut throws = parse_sync_slot(slots[0].trim(), Hand::Left)?;
                     throws.extend(parse_sync_slot(slots[1].trim(), Hand::Right)?);
                     state.saw_sync = true;
+                    state.non_vanilla_async = true;
                     beats.push(Beat { throws });
                     pos = close + 1;
                     if chars.get(pos) == Some(&'!') {
@@ -346,6 +388,7 @@ fn parse_pattern_fragment(
                 let hand = hand_for_async_beat(beat_number, state.right_on_even[0]);
                 let context = ThrowContext::new(1, 1, hand, state.hand_fixed[0]);
                 let throws = parse_multiplex_slice(&chars[pos + 1..close], context)?;
+                state.non_vanilla_async |= throws.iter().any(|throw| throw.cross);
                 state.saw_async = true;
                 beats.push(Beat { throws });
                 pos = close + 1;
@@ -356,6 +399,7 @@ fn parse_pattern_fragment(
                 let left = chars[pos] == 'L';
                 state.right_on_even[0] = if beat_number % 2 == 0 { !left } else { left };
                 state.hand_fixed[0] = true;
+                state.non_vanilla_async |= beat_number > 0;
                 pos += 1;
             }
             ch if is_throw_value_start(ch) => {
@@ -364,6 +408,7 @@ fn parse_pattern_fragment(
                 let hand = hand_for_async_beat(beat_number, state.right_on_even[0]);
                 let context = ThrowContext::new(1, 1, hand, state.hand_fixed[0]);
                 let throw = parse_throw_from_slice(chars, &mut pos, context)?;
+                state.non_vanilla_async |= throw.cross;
                 state.saw_async = true;
                 beats.push(Beat {
                     throws: vec![throw],
@@ -372,7 +417,10 @@ fn parse_pattern_fragment(
             ch => return Err(format!("Unexpected character in siteswap: {ch}")),
         }
     }
-    Ok(beats)
+    Ok(PatternFragment {
+        beats,
+        switch_repeat,
+    })
 }
 
 fn parse_general_passing_group(
@@ -413,9 +461,11 @@ fn parse_general_passing_group(
     for throw in beats.iter().flat_map(|beat| &beat.throws) {
         if throw.sync {
             state.saw_sync = true;
+            state.non_vanilla_async = true;
         } else {
             state.saw_async = true;
         }
+        state.non_vanilla_async |= throw.cross;
     }
     Ok(beats)
 }
@@ -465,14 +515,6 @@ fn opposite_siteswap_hand(hand: Hand) -> Hand {
         Hand::Left => Hand::Right,
         Hand::Right => Hand::Left,
     }
-}
-
-fn beats_are_vanilla_async(beats: &[Beat]) -> bool {
-    beats.iter().all(|beat| {
-        beat.throws
-            .iter()
-            .all(|throw| !throw.cross && !throw.hand_fixed)
-    })
 }
 
 fn parse_sync_slot(slot: &str, hand: Hand) -> Result<Vec<ThrowSpec>, String> {
@@ -962,6 +1004,18 @@ mod tests {
         assert_eq!(spec.balls, 3);
         assert_eq!(spec.max_throw, 5);
         assert!((spec.bps - 4.0).abs() < f64::EPSILON);
+        assert!(spec.bps_explicit);
+    }
+
+    #[test]
+    fn calculates_default_bps_like_mhn_pattern() {
+        let cascade = parse_config("pattern=3").unwrap();
+        assert!(!cascade.bps_explicit);
+        assert!((cascade.bps - 2.9).abs() < 1e-9);
+
+        let high_throw = parse_config("pattern=9").unwrap();
+        let expected = 5.5_f64.max((9.0 - DWELL_DEFAULT) / SECS_AIRTIME_MAX);
+        assert!((high_throw.bps - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -976,9 +1030,26 @@ mod tests {
     fn parses_synchronous_star_as_mirrored_half() {
         let spec = parse_config("pattern=(2,6x)(2x,6)*;colors=orbits").unwrap();
         assert!(spec.sync);
+        assert!(spec.switch_repeat);
+        assert!(!spec.vanilla_async);
         assert_eq!(spec.beats.len(), 8);
         assert_eq!(spec.balls, 4);
         assert_eq!(target_hand(&spec, Hand::Right, 6, true), Hand::Left);
+    }
+
+    #[test]
+    fn distinguishes_root_and_nested_switch_repeats() {
+        let root = parse_config("pattern=3*").unwrap();
+        assert!(root.switch_repeat);
+        assert_eq!(root.beats.len(), 2);
+
+        let nested = parse_config("pattern=(3*^2)").unwrap();
+        assert!(!nested.switch_repeat);
+        assert!(nested.vanilla_async);
+        assert_eq!(nested.beats.len(), 4);
+
+        let leading_hand_spec = parse_config("pattern=R3").unwrap();
+        assert!(leading_hand_spec.vanilla_async);
     }
 
     #[test]

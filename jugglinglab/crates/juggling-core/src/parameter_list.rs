@@ -100,7 +100,7 @@ impl ParameterList {
             0 => Ok(()),
             1 => Err(format!("Unused parameter: \"{}\"", self.names[0])),
             _ => Err(format!(
-                "Parametri non usati: {}",
+                "Unused parameters: {}",
                 self.names
                     .iter()
                     .map(|name| format!("\"{name}\""))

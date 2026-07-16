@@ -1,3 +1,4 @@
+use crate::mhn_hands::Coordinate;
 use crate::parameter_list::ParameterList;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +24,9 @@ pub enum PropKind {
 impl PropSpec {
     pub fn from_jml(prop_type: &str, modifier: Option<&str>) -> Result<Self, String> {
         let mut spec = Self::default_for_type(prop_type);
+        if let PropKind::Unknown(name) = &spec.kind {
+            return Err(format!("Prop type '{name}' is not recognized"));
+        }
         let params = ParameterList::parse(modifier)?;
 
         if let Some(color) = params.get_parameter("color") {
@@ -48,14 +52,15 @@ impl PropSpec {
             }
             PropKind::Image => {
                 if let Some(source) = params.get_parameter("image") {
-                    spec.image_source = Some(source.trim().to_string());
-                    spec.image_aspect_ratio = Some(default_image_aspect_ratio(source));
+                    let source = decode_image_source(source);
+                    spec.image_source = Some(source.clone());
+                    spec.image_aspect_ratio = Some(default_image_aspect_ratio(&source));
                 }
                 if let Some(width) = params.get_parameter("width") {
                     spec.diameter = parse_positive(width, "width")?;
                 }
             }
-            PropKind::Unknown(_) => {}
+            PropKind::Unknown(_) => unreachable!(),
         }
 
         Ok(spec)
@@ -106,10 +111,7 @@ impl PropSpec {
     }
 
     pub fn radius_cm(&self) -> f64 {
-        match self.kind {
-            PropKind::Image => self.diameter,
-            _ => 0.5 * self.diameter,
-        }
+        0.5 * self.diameter
     }
 
     pub fn min_z_cm(&self) -> f64 {
@@ -118,6 +120,60 @@ impl PropSpec {
             _ => -self.radius_cm(),
         }
     }
+
+    pub fn max_coordinate_cm(&self) -> Coordinate {
+        match self.kind {
+            PropKind::Image => Coordinate {
+                x: 0.5 * self.diameter,
+                y: 0.0,
+                z: self.diameter,
+            },
+            _ => Coordinate {
+                x: self.radius_cm(),
+                y: 0.0,
+                z: self.radius_cm(),
+            },
+        }
+    }
+
+    pub fn min_coordinate_cm(&self) -> Coordinate {
+        match self.kind {
+            PropKind::Image => Coordinate {
+                x: -0.5 * self.diameter,
+                y: 0.0,
+                z: 0.0,
+            },
+            _ => Coordinate {
+                x: -self.radius_cm(),
+                y: 0.0,
+                z: -self.radius_cm(),
+            },
+        }
+    }
+
+    pub fn optimizer_width_cm(&self) -> f64 {
+        match self.kind {
+            PropKind::Ring => 0.05 * self.diameter,
+            _ => self.diameter,
+        }
+    }
+
+    pub fn optimizer_radius_cm(&self) -> f64 {
+        0.5 * self.optimizer_width_cm()
+    }
+}
+
+pub fn encode_image_source(source: &str) -> String {
+    source.trim().replace(';', "%3B")
+}
+
+pub fn decode_image_source(source: &str) -> String {
+    source.trim().replace("%3B", ";").replace("%3b", ";")
+}
+
+pub fn image_source_requires_embedding(source: &str) -> bool {
+    let source = decode_image_source(source);
+    !source.to_ascii_lowercase().starts_with("data:") && source.contains('/')
 }
 
 fn parse_positive(value: &str, name: &str) -> Result<f64, String> {
@@ -158,7 +214,7 @@ fn css_color_name(name: &str) -> &'static str {
         "blue" => "#0000ff",
         "cyan" => "#00ffff",
         "gray" | "grey" => "#808080",
-        "green" => "#008000",
+        "green" => "#00ff00",
         "magenta" => "#ff00ff",
         "orange" => "#ffc800",
         "pink" => "#ffafaf",
@@ -190,6 +246,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unrecognized_jml_prop_types() {
+        assert!(
+            PropSpec::from_jml("unknown-prop", None)
+                .unwrap_err()
+                .contains("is not recognized")
+        );
+    }
+
+    #[test]
     fn parses_ring_diameters() {
         let prop =
             PropSpec::from_jml("ring", Some("outside=30;inside=22;color={10,20,30}")).unwrap();
@@ -206,5 +271,55 @@ mod tests {
         assert_eq!(prop.image_source.as_deref(), Some("ball.png"));
         assert_eq!(prop.diameter, 16.0);
         assert_eq!(prop.min_z_cm(), 0.0);
+        assert_eq!(
+            prop.max_coordinate_cm(),
+            Coordinate {
+                x: 8.0,
+                y: 0.0,
+                z: 16.0
+            }
+        );
+        assert_eq!(
+            prop.min_coordinate_cm(),
+            Coordinate {
+                x: -8.0,
+                y: 0.0,
+                z: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn image_sources_round_trip_jml_separator_escaping() {
+        let source = "data:image/png;base64,AAAA";
+        let encoded = encode_image_source(source);
+        assert_eq!(encoded, "data:image/png%3Bbase64,AAAA");
+        assert_eq!(decode_image_source(&encoded), source);
+
+        let prop = PropSpec::from_jml("image", Some(&format!("image={encoded};width=12"))).unwrap();
+        assert_eq!(prop.image_source.as_deref(), Some(source));
+        assert!(!image_source_requires_embedding(source));
+        assert!(!image_source_requires_embedding(
+            "DATA:image/png;base64,AAAA"
+        ));
+        assert!(image_source_requires_embedding(
+            "https://example.com/ball.png"
+        ));
+        assert!(image_source_requires_embedding("images/ball.png"));
+        assert!(!image_source_requires_embedding("ball.png"));
+    }
+
+    #[test]
+    fn exposes_original_layout_and_optimizer_extents() {
+        let ball = PropSpec::from_jml("ball", Some("diam=12")).unwrap();
+        assert_eq!(ball.radius_cm(), 6.0);
+        assert_eq!(ball.optimizer_width_cm(), 12.0);
+        assert_eq!(ball.optimizer_radius_cm(), 6.0);
+
+        let ring = PropSpec::from_jml("ring", Some("outside=40;inside=32")).unwrap();
+        assert_eq!(ring.radius_cm(), 20.0);
+        assert_eq!(ring.min_z_cm(), -20.0);
+        assert_eq!(ring.optimizer_width_cm(), 2.0);
+        assert_eq!(ring.optimizer_radius_cm(), 1.0);
     }
 }

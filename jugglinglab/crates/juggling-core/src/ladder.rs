@@ -1,13 +1,127 @@
 use crate::animation::{JmlAnimation, TransitionKind};
+use crate::mhn_symmetry::MhnSymmetryType;
 use std::collections::BTreeMap;
 
 const MIN_THROW_SEP_TIME: f64 = 0.03;
 const MIN_EVENT_SEP_TIME: f64 = 0.01;
 const MIN_POSITION_SEP_TIME: f64 = 0.02;
+pub const MAX_JUGGLERS: usize = 8;
+pub const MAX_PATHS: usize = 100;
+pub const LADDER_BORDER_SIDES: f64 = 0.15;
+pub const LADDER_JUGGLER_SEPARATION: f64 = 0.45;
+const BASE_ITEM_RADIUS_PX: f64 = 5.0;
+const BORDER_TOP_PX: f64 = 25.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LadderItemSizing {
+    pub transition_radius_px: f64,
+    pub position_radius_px: f64,
+}
+
+pub fn ladder_item_sizing(
+    diagram: &LadderDiagram,
+    width_px: f64,
+    period_height_px: f64,
+    mobile: bool,
+) -> LadderItemSizing {
+    let base = LadderItemSizing {
+        transition_radius_px: BASE_ITEM_RADIUS_PX,
+        position_radius_px: BASE_ITEM_RADIUS_PX,
+    };
+    if !mobile
+        || !width_px.is_finite()
+        || width_px <= 0.0
+        || !period_height_px.is_finite()
+        || period_height_px <= 0.0
+    {
+        return base;
+    }
+
+    let jugglers = diagram
+        .tracks
+        .iter()
+        .map(|track| track.juggler)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let width_units = 2.0 * LADDER_BORDER_SIDES
+        + jugglers as f64
+        + jugglers.saturating_sub(1) as f64 * LADDER_JUGGLER_SEPARATION;
+    let scale = width_px / width_units;
+    let left_x = (scale * LADDER_BORDER_SIDES).round();
+    let right_x = (scale * (LADDER_BORDER_SIDES + 1.0)).round();
+    let max_transitions = diagram
+        .events
+        .iter()
+        .map(|event| event.transitions.len())
+        .max()
+        .unwrap_or(0);
+    let horizontal_divisor = 4 * max_transitions + 4;
+    let expanded_radius = ((right_x - left_x) / horizontal_divisor as f64).floor();
+    let mut radius = BASE_ITEM_RADIUS_PX.max(expanded_radius);
+
+    let mut events_by_hand = BTreeMap::<(usize, LadderHand), Vec<f64>>::new();
+    for event in &diagram.events {
+        events_by_hand
+            .entry((event.juggler, event.hand))
+            .or_default()
+            .push(event.time);
+    }
+    let period = diagram.period_secs.max(0.1);
+    let mut separations = Vec::new();
+    for times in events_by_hand.values_mut() {
+        times.sort_by(f64::total_cmp);
+        for pair in times.windows(2) {
+            let first_y = (period_height_px * pair[0] / period).round();
+            let second_y = (period_height_px * pair[1] / period).round();
+            let separation = second_y - first_y;
+            if separation > 0.0 {
+                separations.push(separation);
+            }
+        }
+    }
+    separations.sort_by(f64::total_cmp);
+    if separations.len() > 2 {
+        let minimum_separation = (separations[2] * 0.8).round();
+        if minimum_separation < 2.0 * radius {
+            radius = (minimum_separation / 2.0).round();
+        }
+    }
+
+    radius = radius.clamp(BASE_ITEM_RADIUS_PX, BORDER_TOP_PX - 3.0);
+    LadderItemSizing {
+        transition_radius_px: radius,
+        position_radius_px: radius,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LadderLimit {
+    Jugglers { actual: usize, maximum: usize },
+    Paths { actual: usize, maximum: usize },
+}
+
+pub fn ladder_limit(jugglers: usize, paths: usize) -> Option<LadderLimit> {
+    if jugglers > MAX_JUGGLERS {
+        Some(LadderLimit::Jugglers {
+            actual: jugglers,
+            maximum: MAX_JUGGLERS,
+        })
+    } else if paths > MAX_PATHS {
+        Some(LadderLimit::Paths {
+            actual: paths,
+            maximum: MAX_PATHS,
+        })
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LadderDiagram {
     pub period_secs: f64,
+    pub has_switch_symmetry: bool,
+    pub has_switch_delay_symmetry: bool,
     pub tracks: Vec<LadderTrack>,
     pub events: Vec<LadderEvent>,
     pub transitions: Vec<LadderTransition>,
@@ -99,20 +213,6 @@ pub struct LadderEdge {
     pub wraps_period: bool,
 }
 
-#[derive(Clone, Debug)]
-struct PathNode {
-    event_index: usize,
-    path: usize,
-    time: f64,
-    juggler: usize,
-    hand: LadderHand,
-    transition_index: usize,
-    transition: TransitionKind,
-    throw_type: Option<String>,
-    throw_mod: Option<String>,
-    order: usize,
-}
-
 pub fn build_ladder_diagram(jml: &JmlAnimation) -> LadderDiagram {
     let period_secs = jml.period_secs.max(0.1);
     let tracks = build_tracks(jml);
@@ -122,9 +222,7 @@ pub fn build_ladder_diagram(jml: &JmlAnimation) -> LadderDiagram {
         .collect::<BTreeMap<_, _>>();
     let mut events = Vec::new();
     let mut transitions = Vec::new();
-    let mut by_path = vec![Vec::<PathNode>::new(); jml.paths.max(1)];
     let mut primary_occurrences = BTreeMap::<usize, usize>::new();
-    let mut order = 0;
 
     for (image_index, image) in jml.loop_event_images.iter().enumerate() {
         let event = &image.event;
@@ -176,83 +274,79 @@ pub fn build_ladder_diagram(jml: &JmlAnimation) -> LadderDiagram {
         }
     }
 
-    for image in &jml.all_event_images {
-        let event = &image.event;
-        let (juggler, hand) = parse_event_hand(&event.hand);
-        for (transition_index, transition) in event.transitions.iter().enumerate() {
-            if transition.path == 0 || transition.path > by_path.len() {
-                continue;
-            }
-            by_path[transition.path - 1].push(PathNode {
-                event_index: image.primary_index,
-                path: transition.path,
-                time: event.t,
-                juggler,
-                hand,
-                transition_index,
-                transition: transition.kind,
-                throw_type: transition.throw_type.clone(),
-                throw_mod: transition.throw_mod.clone(),
-                order,
-            });
-            order += 1;
-        }
-    }
-
-    for nodes in &mut by_path {
-        nodes.sort_by(|left, right| {
-            left.time
-                .total_cmp(&right.time)
-                .then(left.juggler.cmp(&right.juggler))
-                .then(left.hand.cmp(&right.hand))
-                .then(left.order.cmp(&right.order))
-        });
-    }
-
     let mut edges = Vec::new();
-    for nodes in by_path {
-        for pair in nodes.windows(2) {
-            let start = &pair[0];
-            let end = &pair[1];
-            let end_time_absolute = end.time;
-            if end_time_absolute - start.time <= 1e-9 {
+    for (start_image_index, start_image) in jml.all_event_images.iter().enumerate() {
+        let start_event = &start_image.event;
+        let (start_juggler, start_hand) = parse_event_hand(&start_event.hand);
+        let Some(start_track) = track_index.get(&(start_juggler, start_hand)).copied() else {
+            continue;
+        };
+
+        for (start_transition_index, start_transition) in start_event.transitions.iter().enumerate()
+        {
+            if start_transition.path == 0 || start_transition.path > jml.paths.max(1) {
                 continue;
             }
-            if end_time_absolute < -1e-9 || start.time > period_secs + 1e-9 {
+            let Some(end_image) =
+                jml.all_event_images[start_image_index + 1..]
+                    .iter()
+                    .find(|image| {
+                        image
+                            .event
+                            .transitions
+                            .iter()
+                            .any(|transition| transition.path == start_transition.path)
+                    })
+            else {
+                continue;
+            };
+            let Some((end_transition_index, end_transition)) = end_image
+                .event
+                .transitions
+                .iter()
+                .enumerate()
+                .find(|(_, transition)| transition.path == start_transition.path)
+            else {
+                continue;
+            };
+            let end_event = &end_image.event;
+            let end_time_absolute = end_event.t;
+            if end_time_absolute - start_event.t <= 1e-9 {
                 continue;
             }
-            let wraps_period = start.time < 0.0 || end_time_absolute > period_secs;
-            let Some(start_track) = track_index.get(&(start.juggler, start.hand)).copied() else {
+            if end_time_absolute < -1e-9 || start_event.t > period_secs + 1e-9 {
+                continue;
+            }
+            let (end_juggler, end_hand) = parse_event_hand(&end_event.hand);
+            let Some(end_track) = track_index.get(&(end_juggler, end_hand)).copied() else {
                 continue;
             };
-            let Some(end_track) = track_index.get(&(end.juggler, end.hand)).copied() else {
-                continue;
-            };
+            let wraps_period = start_event.t < 0.0 || end_time_absolute > period_secs;
             let edge_number = edges.len() + 1;
             edges.push(LadderEdge {
-                id: format!("path-{}-{edge_number}", start.path),
-                path: start.path,
+                id: format!("path-{}-{edge_number}", start_transition.path),
+                path: start_transition.path,
                 start: LadderEndpoint {
-                    event_index: start.event_index,
-                    time: start.time,
-                    juggler: start.juggler,
-                    hand: start.hand,
+                    event_index: start_image.primary_index,
+                    time: start_event.t,
+                    juggler: start_juggler,
+                    hand: start_hand,
                     track_index: start_track,
-                    transition_index: start.transition_index,
-                    transition: start.transition,
-                    throw_type: start.throw_type.clone(),
-                    throw_mod: start.throw_mod.clone(),
+                    transition_index: start_transition_index,
+                    transition: start_transition.kind,
+                    throw_type: start_transition.throw_type.clone(),
+                    throw_mod: start_transition.throw_mod.clone(),
                 },
                 end: LadderEndpoint {
-                    event_index: end.event_index,
-                    time: end.time,
-                    juggler: end.juggler,
-                    hand: end.hand,
+                    event_index: end_image.primary_index,
+                    time: end_event.t,
+                    juggler: end_juggler,
+                    hand: end_hand,
                     track_index: end_track,
-                    transition_index: end.transition_index,
-                    transition: end.transition,
-                    throw_type: end.throw_type.clone(),
-                    throw_mod: end.throw_mod.clone(),
+                    transition_index: end_transition_index,
+                    transition: end_transition.kind,
+                    throw_type: end_transition.throw_type.clone(),
+                    throw_mod: end_transition.throw_mod.clone(),
                 },
                 end_time_absolute,
                 wraps_period,
@@ -262,6 +356,8 @@ pub fn build_ladder_diagram(jml: &JmlAnimation) -> LadderDiagram {
 
     LadderDiagram {
         period_secs,
+        has_switch_symmetry: jml.symmetries.contains(&MhnSymmetryType::Switch),
+        has_switch_delay_symmetry: jml.symmetries.contains(&MhnSymmetryType::SwitchDelay),
         tracks,
         events,
         transitions,
@@ -620,6 +716,61 @@ pub fn transition_label(kind: TransitionKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ladder_limits_match_the_original_editor() {
+        assert_eq!(ladder_limit(MAX_JUGGLERS, MAX_PATHS), None);
+        assert_eq!(
+            ladder_limit(MAX_JUGGLERS + 1, MAX_PATHS + 1),
+            Some(LadderLimit::Jugglers {
+                actual: MAX_JUGGLERS + 1,
+                maximum: MAX_JUGGLERS,
+            })
+        );
+        assert_eq!(
+            ladder_limit(1, MAX_PATHS + 1),
+            Some(LadderLimit::Paths {
+                actual: MAX_PATHS + 1,
+                maximum: MAX_PATHS,
+            })
+        );
+    }
+
+    #[test]
+    fn ladder_mobile_item_sizing_matches_original_width_limits() {
+        let xml = r#"
+        <jml version="3">
+        <pattern>
+        <setup jugglers="1" paths="2" props="1,1"/>
+        <symmetry type="delay" pperm="(1,2)" delay="1"/>
+        <event x="0" y="0" z="0" t="0" hand="1:right">
+          <throw path="1" type="toss"/>
+          <holding path="2"/>
+        </event>
+        <event x="0" y="0" z="0" t="0.5" hand="1:left">
+          <catch path="1"/>
+          <holding path="2"/>
+        </event>
+        </pattern>
+        </jml>
+        "#;
+        let diagram = build_ladder_diagram(&parse_jml_animation(xml).unwrap());
+
+        assert_eq!(
+            ladder_item_sizing(&diagram, 390.0, 500.0, false),
+            LadderItemSizing {
+                transition_radius_px: 5.0,
+                position_radius_px: 5.0,
+            }
+        );
+        assert_eq!(
+            ladder_item_sizing(&diagram, 390.0, 500.0, true),
+            LadderItemSizing {
+                transition_radius_px: 22.0,
+                position_radius_px: 22.0,
+            }
+        );
+    }
     use crate::animation::{parse_jml_animation, siteswap_to_jml_animation};
     use crate::siteswap::parse_config;
 
@@ -628,6 +779,7 @@ mod tests {
         let xml = r#"
         <jml version="3">
         <pattern>
+        <prop type="ball"/>
         <setup jugglers="1" paths="1" props="1"/>
         <symmetry type="delay" pperm="1" delay="1"/>
         <event x="0" y="0" z="0" t="0" hand="1:right">
@@ -657,6 +809,7 @@ mod tests {
         let xml = r#"
         <jml version="3">
         <pattern>
+        <prop type="ball"/>
         <setup jugglers="1" paths="1" props="1"/>
         <symmetry type="delay" pperm="1" delay="1"/>
         <event x="0" y="0" z="0" t="0.25" hand="1:left">
@@ -672,6 +825,31 @@ mod tests {
         let diagram = build_ladder_diagram(&jml);
 
         assert!(diagram.edges.iter().any(|edge| edge.wraps_period));
+    }
+
+    #[test]
+    fn ladder_exposes_switch_symmetry_guides_from_jml() {
+        let xml = r#"
+        <jml version="3">
+        <pattern>
+        <setup jugglers="1" paths="1" props="1"/>
+        <symmetry type="delay" pperm="1" delay="1"/>
+        <symmetry type="switch" jperm="(1,1*)" pperm="1"/>
+        <symmetry type="switchdelay" jperm="(1,1*)" pperm="1"/>
+        <event x="0" y="0" z="0" t="0" hand="1:right">
+          <throw path="1" type="toss"/>
+        </event>
+        <event x="0" y="0" z="0" t="0.5" hand="1:left">
+          <catch path="1"/>
+        </event>
+        </pattern>
+        </jml>
+        "#;
+        let jml = parse_jml_animation(xml).unwrap();
+        let diagram = build_ladder_diagram(&jml);
+
+        assert!(diagram.has_switch_symmetry);
+        assert!(diagram.has_switch_delay_symmetry);
     }
 
     #[test]
@@ -792,6 +970,43 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first_throw.end.event_index, 1);
+    }
+
+    #[test]
+    fn ladder_creates_an_edge_for_every_transition_like_original_layout() {
+        let xml = r#"
+        <jml version="3">
+        <pattern>
+        <setup jugglers="1" paths="1" props="1"/>
+        <symmetry type="delay" pperm="1" delay="1"/>
+        <event x="0" y="0" z="0" t="0" hand="1:right">
+          <catch path="1"/>
+          <throw path="1" type="toss"/>
+        </event>
+        <event x="0" y="0" z="0" t="0.5" hand="1:left">
+          <catch path="1"/>
+        </event>
+        </pattern>
+        </jml>
+        "#;
+        let jml = parse_jml_animation(xml).unwrap();
+        let diagram = build_ladder_diagram(&jml);
+        let starts = diagram
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.start.event_index == 0 && edge.start.time.abs() < 1e-9 && edge.path == 1
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0].start.transition_index, 0);
+        assert_eq!(starts[1].start.transition_index, 1);
+        assert!(starts[0].includes_holding());
+        assert!(!starts[1].includes_holding());
+        assert_eq!(starts[0].end.event_index, 1);
+        assert_eq!(starts[0].end.transition_index, 0);
+        assert_eq!(starts[0].end.time, starts[1].end.time);
     }
 
     #[test]

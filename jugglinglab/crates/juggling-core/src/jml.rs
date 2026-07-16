@@ -1,10 +1,34 @@
 use roxmltree::{Document, Node, NodeType};
 
+use crate::mhn_matrix::MhnMatrix;
+use crate::siteswap;
+
+pub(crate) const CURRENT_JML_VERSION: &str = "3";
+const JML_TAGS: [&str; 16] = [
+    "jml",
+    "pattern",
+    "patternlist",
+    "title",
+    "info",
+    "basepattern",
+    "prop",
+    "setup",
+    "symmetry",
+    "event",
+    "throw",
+    "catch",
+    "softcatch",
+    "line",
+    "holding",
+    "position",
+];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PatternLibrary {
     pub title: Option<String>,
     pub info: Option<String>,
     pub records: Vec<PatternRecord>,
+    pub is_pattern_list: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,10 +63,7 @@ impl PatternRecord {
 pub fn parse_jml(xml: &str) -> Result<PatternLibrary, String> {
     let cleaned = strip_doctype(xml);
     let doc = Document::parse(&cleaned).map_err(|err| format!("Invalid XML/JML: {err}"))?;
-    let root = doc
-        .descendants()
-        .find(|node| node.has_tag_name("jml"))
-        .ok_or_else(|| "Missing <jml> tag".to_string())?;
+    let root = validate_jml_tree(&doc)?;
 
     if let Some(patternlist) = root
         .children()
@@ -66,10 +87,63 @@ pub fn parse_jml(xml: &str) -> Result<PatternLibrary, String> {
                     .unwrap_or_default(),
                 raw_pattern: Some(serialize_node(pattern)),
             }],
+            is_pattern_list: false,
         })
     } else {
         Err("The JML file does not contain a pattern or patternlist".to_string())
     }
+}
+
+pub(crate) fn validate_jml_tree<'a, 'input>(
+    doc: &'a Document<'input>,
+) -> Result<Node<'a, 'input>, String> {
+    let root = doc.root_element();
+    if !root.has_tag_name("jml") {
+        return Err("Missing <jml> tag".to_string());
+    }
+
+    for node in root.descendants().filter(Node::is_element) {
+        let tag = node.tag_name().name();
+        if !JML_TAGS.contains(&tag) {
+            let position = doc.text_pos_at(node.range().start);
+            return Err(format!("Unknown JML tag '{tag}' at line {}", position.row));
+        }
+    }
+
+    let version = root.attribute("version").unwrap_or(CURRENT_JML_VERSION);
+    if compare_versions(version, CURRENT_JML_VERSION)? == std::cmp::Ordering::Greater {
+        return Err(format!(
+            "JML version {version} is newer than supported version {CURRENT_JML_VERSION}"
+        ));
+    }
+    Ok(root)
+}
+
+fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering, String> {
+    let parse = |version: &str| {
+        version
+            .split('.')
+            .map(|component| {
+                component
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid JML version '{version}'"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let left = parse(left)?;
+    let right = parse(right)?;
+    for index in 0..left.len().max(right.len()) {
+        match left
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&right.get(index).copied().unwrap_or(0))
+        {
+            std::cmp::Ordering::Equal => {}
+            ordering => return Ok(ordering),
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
 }
 
 pub fn extract_pattern_xml(xml: &str) -> Result<String, String> {
@@ -88,12 +162,25 @@ pub fn extract_pattern_xml(xml: &str) -> Result<String, String> {
 }
 
 pub fn write_pattern_list(title: &str, records: &[PatternRecord]) -> String {
+    write_pattern_list_document(Some(title), None, records)
+}
+
+pub fn write_pattern_list_document(
+    title: Option<&str>,
+    info: Option<&str>,
+    records: &[PatternRecord],
+) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\"?>\n");
     out.push_str("<!DOCTYPE jml SYSTEM \"file://jml.dtd\">\n");
     out.push_str("<jml version=\"3\">\n");
     out.push_str("<patternlist>\n");
-    out.push_str(&format!("<title>{}</title>\n", escape_xml(title)));
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        out.push_str(&format!("<title>{}</title>\n", escape_xml(title)));
+    }
+    if let Some(info) = info.map(str::trim).filter(|info| !info.is_empty()) {
+        out.push_str(&format!("<info>{}</info>\n", escape_xml(info)));
+    }
 
     for record in records {
         out.push('\n');
@@ -109,6 +196,10 @@ pub fn write_pattern_list(title: &str, records: &[PatternRecord]) -> String {
         }
         if let Some(animprefs) = &record.animprefs {
             out.push_str(&format!(" animprefs=\"{}\"", escape_xml(animprefs)));
+        }
+        if record.notation.is_none() && record.animprefs.is_none() {
+            out.push_str("/>\n");
+            continue;
         }
         out.push('>');
 
@@ -165,6 +256,48 @@ pub fn write_pattern_list(title: &str, records: &[PatternRecord]) -> String {
     out
 }
 
+pub fn write_pattern_list_text(records: &[PatternRecord]) -> String {
+    let mut out = records
+        .iter()
+        .map(|record| record.display.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !records.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+pub fn record_to_pattern_jml(record: &PatternRecord) -> Result<String, String> {
+    if record
+        .notation
+        .as_deref()
+        .is_some_and(|notation| notation.eq_ignore_ascii_case("jml"))
+    {
+        if let Some(raw) = &record.raw_pattern {
+            if raw.trim_start().starts_with("<jml") {
+                return Ok(raw.clone());
+            }
+            return Ok(format!(
+                "<?xml version=\"1.0\"?>\n<!DOCTYPE jml SYSTEM \"file://jml.dtd\">\n<jml version=\"3\">\n{}\n</jml>\n",
+                raw.trim()
+            ));
+        }
+    }
+
+    let config = record
+        .config
+        .as_deref()
+        .ok_or_else(|| "Current pattern has no exportable config".to_string())?;
+    let spec = siteswap::parse_config(config)?;
+    let mut matrix = MhnMatrix::from_siteswap(&spec)?;
+    let mut model = matrix.to_jml_pattern(&spec)?;
+    model.info = record.info.clone();
+    model.tags = record.tags.clone();
+    model.assert_valid()?;
+    Ok(model.write_jml(true, true))
+}
+
 pub fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -193,6 +326,7 @@ fn parse_pattern_list(patternlist: Node) -> Result<PatternLibrary, String> {
         title,
         info,
         records,
+        is_pattern_list: true,
     })
 }
 
@@ -261,11 +395,17 @@ fn normalized_text(node: Node) -> Option<String> {
 }
 
 fn split_tags(tags: &str) -> Vec<String> {
-    tags.split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut result = Vec::<String>::new();
+    for tag in tags.split(',').map(str::trim).filter(|tag| !tag.is_empty()) {
+        if result
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tag))
+        {
+            continue;
+        }
+        result.push(tag.to_string());
+    }
+    result
 }
 
 fn strip_doctype(xml: &str) -> String {
@@ -321,9 +461,36 @@ mod tests {
 <line display="3" notation="siteswap">pattern=3</line>
 </patternlist></jml>"#;
         let library = parse_jml(xml).unwrap();
+        assert!(library.is_pattern_list);
         assert_eq!(library.title.as_deref(), Some("Test"));
         assert_eq!(library.records.len(), 1);
         assert_eq!(library.records[0].config.as_deref(), Some("pattern=3"));
+    }
+
+    #[test]
+    fn pattern_list_document_round_trips_text_lines_and_metadata() {
+        let records = vec![
+            PatternRecord {
+                display: "Section".to_string(),
+                notation: None,
+                config: None,
+                animprefs: None,
+                info: None,
+                tags: Vec::new(),
+                raw_pattern: None,
+            },
+            PatternRecord::siteswap("Cascade", "pattern=3"),
+        ];
+
+        let xml = write_pattern_list_document(Some("Favorites"), Some("Personal list"), &records);
+        assert!(xml.contains("<line display=\"Section\"/>"));
+        assert!(xml.contains("<info>Personal list</info>"));
+
+        let parsed = parse_jml(&xml).unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("Favorites"));
+        assert_eq!(parsed.info.as_deref(), Some("Personal list"));
+        assert_eq!(parsed.records, records);
+        assert_eq!(write_pattern_list_text(&records), "Section\nCascade\n");
     }
 
     #[test]
@@ -344,5 +511,73 @@ mod tests {
         assert!(fragment.trim_start().starts_with("<pattern>"));
         assert!(fragment.contains("<title>Fragment</title>"));
         assert!(!fragment.contains("<jml"));
+    }
+
+    #[test]
+    fn rejects_unknown_tags_and_future_versions() {
+        let unknown = r#"<jml version="3"><pattern><widget/></pattern></jml>"#;
+        assert!(
+            parse_jml(unknown)
+                .unwrap_err()
+                .contains("Unknown JML tag 'widget'")
+        );
+
+        let future = r#"<jml version="4"><pattern/></jml>"#;
+        assert!(
+            parse_jml(future)
+                .unwrap_err()
+                .contains("newer than supported")
+        );
+    }
+
+    #[test]
+    fn accepts_equivalent_current_version_spelling() {
+        let xml = r#"<jml version="3.0"><pattern><title>Versioned</title></pattern></jml>"#;
+        let library = parse_jml(xml).unwrap();
+        assert_eq!(library.title.as_deref(), Some("Versioned"));
+    }
+
+    #[test]
+    fn bundled_jml_libraries_round_trip_without_losing_records() {
+        let patterns_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../patterns");
+        let mut fixtures = std::fs::read_dir(&patterns_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "jml"))
+            .collect::<Vec<_>>();
+        fixtures.sort();
+        assert_eq!(fixtures.len(), 19);
+
+        for path in fixtures {
+            let xml = std::fs::read_to_string(&path).unwrap();
+            let parsed = parse_jml(&xml)
+                .unwrap_or_else(|err| panic!("{} did not parse: {err}", path.display()));
+            let written = write_pattern_list_document(
+                parsed.title.as_deref(),
+                parsed.info.as_deref(),
+                &parsed.records,
+            );
+            let reparsed = parse_jml(&written)
+                .unwrap_or_else(|err| panic!("{} did not reparse: {err}", path.display()));
+            assert_eq!(
+                reparsed,
+                parsed,
+                "{} changed after a structured round trip",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn record_serialization_is_core_juggling_logic() {
+        let record = PatternRecord::siteswap("Cascade", "pattern=3");
+        let xml = record_to_pattern_jml(&record).unwrap();
+
+        assert!(xml.contains("<jml version=\"3\">"));
+        assert!(xml.contains("<basepattern notation=\"siteswap\">"));
+        assert!(xml.contains("pattern=3"));
+        assert!(parse_jml(&xml).is_ok());
     }
 }

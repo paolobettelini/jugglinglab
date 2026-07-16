@@ -5,5 +5,7 @@ edition.workspace = true
 
 [dependencies]
 axum.workspace = true
+juggling-core = { path = "../juggling-core" }
+serde.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

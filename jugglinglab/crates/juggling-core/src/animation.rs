@@ -3,6 +3,7 @@ use crate::layout::LaidoutPattern;
 use crate::mhn_body::BodyPosition;
 use crate::mhn_jml::MhnJmlPattern;
 use crate::mhn_matrix::MhnMatrix;
+use crate::mhn_symmetry::MhnSymmetryType;
 use crate::permutation::Permutation;
 use crate::prop::PropSpec;
 use crate::siteswap::{self, SiteswapSpec};
@@ -33,6 +34,7 @@ pub struct JmlAnimation {
     pub props: Vec<PropSpec>,
     pub prop_assignment: Vec<usize>,
     pub path_permutation: Permutation,
+    pub symmetries: Vec<MhnSymmetryType>,
     pub positions: Vec<BodyPosition>,
     pub events: Vec<JmlEvent>,
     pub loop_event_images: Vec<JmlEventImage>,
@@ -70,6 +72,38 @@ impl JmlAnimation {
             .get(path.checked_sub(1)?)?
             .checked_sub(1)?;
         self.props.get(prop_index)
+    }
+
+    pub fn period_with_props(&self) -> usize {
+        let size = self.path_permutation.size();
+        let mut period = 1usize;
+        let mut done = vec![false; size];
+
+        for index in 0..size {
+            if done[index] {
+                continue;
+            }
+            let mut cycle = self.path_permutation.cycle_of(index as i32 + 1);
+            for path in &mut cycle {
+                let path_index = (*path).max(1) as usize - 1;
+                done[path_index] = true;
+                *path = self.prop_assignment.get(path_index).copied().unwrap_or(1) as i32;
+            }
+            for cycle_period in 1..=cycle.len() {
+                if cycle.len() % cycle_period != 0 {
+                    continue;
+                }
+                if cycle
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, prop)| *prop == cycle[(offset + cycle_period) % cycle.len()])
+                {
+                    period = crate::permutation::lcm(period, cycle_period);
+                    break;
+                }
+            }
+        }
+        period
     }
 }
 
@@ -256,14 +290,29 @@ pub fn parse_jml_animation(xml: &str) -> Result<JmlAnimation, String> {
         })
         .collect::<Vec<_>>();
 
-    let period_secs = pattern
+    let delay_symmetry = pattern.children().find(|node| {
+        node.has_tag_name("symmetry")
+            && node
+                .attribute("type")
+                .is_some_and(|value| value.eq_ignore_ascii_case("delay"))
+    });
+    let parsed_path_permutation = delay_symmetry
+        .and_then(|node| node.attribute("pperm"))
+        .and_then(|value| Permutation::parse(paths, value, false).ok())
+        .unwrap_or_else(|| Permutation::identity(paths));
+    let parsed_symmetries = pattern
         .children()
-        .find(|node| {
-            node.has_tag_name("symmetry")
-                && node
-                    .attribute("type")
-                    .is_some_and(|value| value.eq_ignore_ascii_case("delay"))
-        })
+        .filter(|node| node.has_tag_name("symmetry"))
+        .filter_map(
+            |node| match node.attribute("type")?.to_ascii_lowercase().as_str() {
+                "delay" => Some(crate::mhn_symmetry::MhnSymmetryType::Delay),
+                "switch" => Some(crate::mhn_symmetry::MhnSymmetryType::Switch),
+                "switchdelay" => Some(crate::mhn_symmetry::MhnSymmetryType::SwitchDelay),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let period_secs = delay_symmetry
         .and_then(|node| node.attribute("delay"))
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or_else(|| {
@@ -388,7 +437,17 @@ pub fn parse_jml_animation(xml: &str) -> Result<JmlAnimation, String> {
         .as_ref()
         .and_then(|model| model.path_permutation().ok())
         .cloned()
-        .unwrap_or_else(|| Permutation::identity(paths));
+        .unwrap_or(parsed_path_permutation);
+    let symmetries = model
+        .as_ref()
+        .map(|model| {
+            model
+                .symmetries
+                .iter()
+                .map(|symmetry| symmetry.symmetry_type)
+                .collect()
+        })
+        .unwrap_or(parsed_symmetries);
     let layout = model.and_then(|mut model| {
         model.merge_coincident_events();
         LaidoutPattern::from_jml_pattern(&model)
@@ -405,6 +464,7 @@ pub fn parse_jml_animation(xml: &str) -> Result<JmlAnimation, String> {
         props,
         prop_assignment,
         path_permutation,
+        symmetries,
         positions,
         events,
         loop_event_images,
@@ -544,6 +604,30 @@ mod tests {
     }
 
     #[test]
+    fn thousand_and_one_prop_fixture_builds_the_physical_renderer() {
+        let library = crate::jml::parse_jml(include_str!(
+            "../../../../patterns/Omnikrabundi_FunWithJugglingLab.jml"
+        ))
+        .unwrap();
+        let record = library
+            .records
+            .iter()
+            .find(|record| record.display.contains("1001 balls"))
+            .unwrap();
+        let spec = AnimationSpec::from_record(record).unwrap();
+
+        match spec.kind {
+            AnimationKind::Jml(jml) => {
+                assert_eq!(jml.paths, 1001);
+                assert!(jml.layout.is_some());
+            }
+            AnimationKind::Unavailable(error) => {
+                panic!("1001-ball fixture did not produce a physical layout: {error}")
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_siteswaps_do_not_use_legacy_renderer() {
         for config in ["pattern=510", "pattern=654", "pattern=664"] {
             let record = PatternRecord::siteswap(config, config);
@@ -653,10 +737,27 @@ mod tests {
         assert_eq!(jml.prop_assignment_at_time(0.25), vec![1, 2, 3]);
         assert_eq!(jml.prop_assignment_at_time(1.25), vec![2, 3, 1]);
         assert_eq!(jml.prop_assignment_at_time(2.25), vec![3, 1, 2]);
+        assert_eq!(jml.period_with_props(), 3);
         assert_eq!(
             jml.prop_for_path_at_time(1, 1.25).unwrap().kind,
             crate::prop::PropKind::Ring
         );
+    }
+
+    #[test]
+    fn prop_period_uses_the_shortest_repeating_assignment() {
+        let xml = r#"
+        <jml version="3"><pattern>
+        <setup jugglers="1" paths="4" props="1,2,1,2"/>
+        <prop type="ball" mod="color=red"/>
+        <prop type="ball" mod="color=blue"/>
+        <symmetry type="delay" pperm="(1,2,3,4)" delay="1"/>
+        </pattern></jml>
+        "#;
+        let jml = parse_jml_animation(xml).unwrap();
+
+        assert_eq!(jml.path_permutation.order(), 4);
+        assert_eq!(jml.period_with_props(), 2);
     }
 
     #[test]

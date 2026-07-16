@@ -1,5 +1,7 @@
 mod app;
+mod audio;
 mod canvas;
+mod export;
 
 use leptos::{mount::mount_to_body, prelude::*};
 use wasm_bindgen::prelude::*;

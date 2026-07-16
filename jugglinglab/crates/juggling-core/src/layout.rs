@@ -2,6 +2,7 @@ use crate::curve::Curve;
 use crate::mhn_hands::Coordinate;
 use crate::mhn_jml::{MhnJmlEvent, MhnJmlPattern, MhnJmlTransition, MhnJmlTransitionType};
 use crate::parameter_list::ParameterList;
+use crate::prop::PropSpec;
 
 pub const PATTERN_Y: f64 = 30.0;
 pub const TOSS_GRAVITY_DEFAULT: f64 = 980.0;
@@ -17,6 +18,8 @@ pub struct LaidoutPattern {
     pub hand_links: Vec<Vec<Vec<HandLink>>>,
     pub juggler_position_curves: Vec<Curve>,
     pub juggler_angle_curves: Vec<Curve>,
+    pub prop_max: Option<Coordinate>,
+    pub prop_min: Option<Coordinate>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -156,7 +159,6 @@ const UPPER_GAP_ELBOW: f64 = 0.0;
 const UPPER_GAP_SHOULDER: f64 = 0.0;
 const LOWER_TOTAL: f64 = LOWER_LENGTH + LOWER_GAP_WRIST + LOWER_GAP_ELBOW;
 const UPPER_TOTAL: f64 = UPPER_LENGTH + UPPER_GAP_ELBOW + UPPER_GAP_SHOULDER;
-const DEFAULT_BALL_RADIUS: f64 = 5.0;
 const EVENT_BOX_HW_CM: f64 = 5.0;
 
 impl LaidoutPattern {
@@ -170,6 +172,13 @@ impl LaidoutPattern {
         let loop_end_time = pattern.loop_end_time()?;
         let (juggler_position_curves, juggler_angle_curves) =
             build_juggler_curves(pattern, loop_start_time, loop_end_time)?;
+        let mut prop_max = None;
+        let mut prop_min = None;
+        for prop in &pattern.props {
+            let spec = PropSpec::from_jml(&prop.prop_type, prop.modifier.as_deref())?;
+            prop_max = coordinate_option_max(prop_max, Some(spec.max_coordinate_cm()));
+            prop_min = coordinate_option_min(prop_min, Some(spec.min_coordinate_cm()));
+        }
         let mut events = pattern
             .all_event_images()?
             .into_iter()
@@ -205,6 +214,8 @@ impl LaidoutPattern {
             hand_links: vec![vec![Vec::new(); 2]; pattern.number_of_jugglers],
             juggler_position_curves,
             juggler_angle_curves,
+            prop_max,
+            prop_min,
         };
         layout.build_path_links()?;
         layout.build_hand_links();
@@ -340,6 +351,119 @@ impl LaidoutPattern {
         (1..=self.number_of_paths).any(|path| self.is_hand_holding_path(juggler, hand, time, path))
     }
 
+    pub fn path_catch_volume(&self, path: usize, time1: f64, time2: f64) -> f64 {
+        let Some(links) = path
+            .checked_sub(1)
+            .and_then(|index| self.path_links.get(index))
+            .filter(|links| !links.is_empty())
+        else {
+            return 0.0;
+        };
+        let Some(mut index) = links.iter().position(|link| {
+            let start = self.events[link.start_event_index].event.t;
+            let end = self.events[link.end_event_index].event.t;
+            time1 >= start && time1 <= end
+        }) else {
+            return 0.0;
+        };
+
+        let mut was_in_air = false;
+        let mut passes = 0;
+        loop {
+            let link = &links[index];
+            let in_hand = matches!(link.kind, PathLinkKind::InHand { .. });
+            if !in_hand {
+                was_in_air = true;
+            }
+            if in_hand && was_in_air {
+                return 1.0;
+            }
+            let start = self.events[link.start_event_index].event.t;
+            let end = self.events[link.end_event_index].event.t;
+            if time2 >= start && time2 <= end {
+                break;
+            }
+            index += 1;
+            if index == links.len() {
+                index = 0;
+                passes += 1;
+                if passes > 1 {
+                    break;
+                }
+            }
+        }
+        0.0
+    }
+
+    pub fn path_bounce_volume(&self, path: usize, time1: f64, time2: f64) -> f64 {
+        let Some(links) = path
+            .checked_sub(1)
+            .and_then(|index| self.path_links.get(index))
+            .filter(|links| !links.is_empty())
+        else {
+            return 0.0;
+        };
+        let Some(mut index) = links.iter().position(|link| {
+            let start = self.events[link.start_event_index].event.t;
+            let end = self.events[link.end_event_index].event.t;
+            time1 >= start && time1 <= end
+        }) else {
+            return 0.0;
+        };
+
+        let mut passes = 0;
+        loop {
+            let link = &links[index];
+            if let PathLinkKind::Bounce(path) = &link.kind {
+                let volume = path.bounce_volume(time1, time2);
+                if volume > 0.0 {
+                    return volume;
+                }
+            }
+            let start = self.events[link.start_event_index].event.t;
+            let end = self.events[link.end_event_index].event.t;
+            if time2 >= start && time2 <= end {
+                break;
+            }
+            index += 1;
+            if index == links.len() {
+                index = 0;
+                passes += 1;
+                if passes > 1 {
+                    break;
+                }
+            }
+        }
+        0.0
+    }
+
+    pub fn is_bounce_pattern(&self) -> bool {
+        self.path_links
+            .iter()
+            .flatten()
+            .any(|link| matches!(link.kind, PathLinkKind::Bounce(_)))
+    }
+
+    pub fn time_scale_to_fit_throws(&self, multiplier: f64) -> f64 {
+        let mut scale_factor: f64 = 1.0;
+        for link in self.path_links.iter().flatten() {
+            let (duration, minimum_duration) = match &link.kind {
+                PathLinkKind::Toss(path) => (path.duration(), path.min_duration()),
+                PathLinkKind::Bounce(path) => (path.duration(), path.min_duration()),
+                PathLinkKind::InHand { .. } => continue,
+            };
+            if duration > 0.0 && duration < minimum_duration {
+                scale_factor = scale_factor.max(minimum_duration / duration);
+            }
+        }
+
+        if scale_factor > 1.0 {
+            scale_factor * multiplier
+        } else {
+            1.0
+        }
+    }
+
     pub fn juggler_position(&self, juggler: usize, time: f64) -> Result<Coordinate, String> {
         if juggler == 0 || juggler > self.number_of_jugglers {
             return Err(format!("Juggler {juggler} out of range"));
@@ -465,18 +589,12 @@ impl LaidoutPattern {
         }
 
         if pattern_max.is_some() && pattern_min.is_some() {
-            let prop_max = Coordinate {
-                x: DEFAULT_BALL_RADIUS,
-                y: 0.0,
-                z: DEFAULT_BALL_RADIUS,
-            };
-            let prop_min = Coordinate {
-                x: -DEFAULT_BALL_RADIUS,
-                y: 0.0,
-                z: -DEFAULT_BALL_RADIUS,
-            };
-            pattern_max = pattern_max.map(|max| coordinate_add(max, prop_max));
-            pattern_min = pattern_min.map(|min| coordinate_add(min, prop_min));
+            if let Some(prop_max) = self.prop_max {
+                pattern_max = pattern_max.map(|max| coordinate_add(max, prop_max));
+            }
+            if let Some(prop_min) = self.prop_min {
+                pattern_min = pattern_min.map(|min| coordinate_add(min, prop_min));
+            }
         }
 
         let mut hand_max = None;
@@ -758,7 +876,7 @@ impl LaidoutPattern {
             MhnJmlTransitionType::Throw | MhnJmlTransitionType::Holding => {
                 if start_transition.transition_type == MhnJmlTransitionType::Throw {
                     return Err(format!(
-                        "Due throw successivi sul path {}",
+                        "Two consecutive throws on path {}",
                         end_transition.path
                     ));
                 }
@@ -770,7 +888,7 @@ impl LaidoutPattern {
                 }
                 if start_event.event.hand != end_event.event.hand {
                     return Err(format!(
-                        "La mano cambia mentre il path {} e' in mano",
+                        "The hand changes while path {} is in hand",
                         end_transition.path
                     ));
                 }
@@ -784,7 +902,7 @@ impl LaidoutPattern {
             | MhnJmlTransitionType::GrabCatch => {
                 if start_transition.transition_type != MhnJmlTransitionType::Throw {
                     return Err(format!(
-                        "Due catch successivi sul path {}",
+                        "Two consecutive catches on path {}",
                         end_transition.path
                     ));
                 }
@@ -966,7 +1084,7 @@ impl LaidoutPattern {
 
             chain_len += 1;
             if chain_len > link_count + 1 {
-                return Err("layoutHandPaths(): catena mano non valida".to_string());
+                return Err("layoutHandPaths(): invalid hand chain".to_string());
             }
         }
         Ok(())
@@ -1043,7 +1161,7 @@ impl LaidoutPattern {
             ) {
                 link_index += 1;
                 if link_index >= link_count {
-                    return Err("layoutHandPaths(): delay event mano non trovato".to_string());
+                    return Err("layoutHandPaths(): delayed hand event not found".to_string());
                 }
             }
 
@@ -1293,7 +1411,7 @@ impl TossPath {
         let gravity = parse_gravity(modifier)?;
         let duration = end_time - start_time;
         if duration <= 0.0 {
-            return Err("TossPath duration non positiva".to_string());
+            return Err("TossPath duration must be positive".to_string());
         }
         let az = -0.5 * gravity;
         let cx = start.x;
@@ -1321,7 +1439,7 @@ impl TossPath {
 
     pub fn coordinate_at(&self, time: f64) -> Result<Coordinate, String> {
         if time < self.start_time || time > self.end_time {
-            return Err(format!("time t={time} fuori TossPath"));
+            return Err(format!("Time t={time} is outside TossPath"));
         }
         let t = time - self.start_time;
         Ok(Coordinate {
@@ -1329,6 +1447,14 @@ impl TossPath {
             y: self.cy + self.by * t,
             z: self.cz + t * (self.bz + self.az * t),
         })
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.end_time - self.start_time
+    }
+
+    pub fn min_duration(&self) -> f64 {
+        0.0
     }
 
     pub fn max_between(&self, time1: f64, time2: f64) -> Option<Coordinate> {
@@ -1433,7 +1559,7 @@ impl BouncePath {
     fn calc_path(&mut self) -> Result<(), String> {
         let duration = self.end_time - self.start_time;
         if duration <= 0.0 {
-            return Err("BouncePath duration non positiva".to_string());
+            return Err("BouncePath duration must be positive".to_string());
         }
 
         for n in (1..=self.bounces).rev() {
@@ -1563,9 +1689,43 @@ impl BouncePath {
         roots
     }
 
+    pub fn duration(&self) -> f64 {
+        self.end_time - self.start_time
+    }
+
+    pub fn min_duration(&self) -> f64 {
+        if self.bounces == 1 && self.hyper && self.forced {
+            return 0.0;
+        }
+
+        let mut lower = 0.0;
+        let mut upper = 1.0;
+        while !self.is_feasible_duration(upper) {
+            lower = upper;
+            upper *= 2.0;
+        }
+        while upper - lower > 0.0001 {
+            let average = 0.5 * (lower + upper);
+            if self.is_feasible_duration(average) {
+                upper = average;
+            } else {
+                lower = average;
+            }
+        }
+        upper
+    }
+
+    fn is_feasible_duration(&self, duration: f64) -> bool {
+        self.solve_bounce_equation(self.bounces, duration)
+            .into_iter()
+            .any(|(root, liftcatch)| {
+                !(self.forced ^ (root < 0.0)) && !(self.hyper ^ liftcatch ^ self.forced)
+            })
+    }
+
     pub fn coordinate_at(&self, time: f64) -> Result<Coordinate, String> {
         if time < self.start_time || time > self.end_time {
-            return Err(format!("time t={time} fuori BouncePath"));
+            return Err(format!("Time t={time} is outside BouncePath"));
         }
         let t = time - self.start_time;
         let mut z = 0.0;
@@ -2190,6 +2350,98 @@ mod tests {
     }
 
     #[test]
+    fn bounce_minimum_duration_matches_forced_hyper_rules() {
+        let start = Coordinate {
+            x: 0.0,
+            y: 0.0,
+            z: 100.0,
+        };
+        let end = Coordinate {
+            x: 20.0,
+            y: 0.0,
+            z: 100.0,
+        };
+        let normal = BouncePath::new(start, 0.0, end, 1.0, None).unwrap();
+        let minimum = normal.min_duration();
+        assert!(minimum > 0.0);
+        assert!(normal.is_feasible_duration(minimum + 0.0001));
+        assert!(!normal.is_feasible_duration((minimum - 0.001).max(0.0)));
+
+        let hyper_forced =
+            BouncePath::new(start, 0.0, end, 1.0, Some("forced=true;hyper=true")).unwrap();
+        assert_eq!(hyper_forced.min_duration(), 0.0);
+    }
+
+    #[test]
+    fn generated_bounce_layout_has_enough_time_after_automatic_scaling() {
+        let spec = crate::siteswap::parse_config("pattern=3BB").unwrap();
+        let mut matrix = crate::mhn_matrix::MhnMatrix::from_siteswap(&spec).unwrap();
+        let pattern = matrix.to_jml_pattern(&spec).unwrap();
+        let layout = LaidoutPattern::from_jml_pattern(&pattern).unwrap();
+
+        assert_eq!(layout.time_scale_to_fit_throws(1.01), 1.0);
+    }
+
+    #[test]
+    fn layout_reports_catches_when_an_air_link_enters_a_hand_link() {
+        let spec = crate::siteswap::parse_config("pattern=3").unwrap();
+        let mut matrix = crate::mhn_matrix::MhnMatrix::from_siteswap(&spec).unwrap();
+        let pattern = matrix.to_jml_pattern(&spec).unwrap();
+        let layout = LaidoutPattern::from_jml_pattern(&pattern).unwrap();
+        let (path, catch_time) = layout
+            .path_links
+            .iter()
+            .enumerate()
+            .find_map(|(path, links)| {
+                links.windows(2).find_map(|pair| {
+                    (!matches!(pair[0].kind, PathLinkKind::InHand { .. })
+                        && matches!(pair[1].kind, PathLinkKind::InHand { .. }))
+                    .then(|| (path + 1, layout.events[pair[1].start_event_index].event.t))
+                })
+            })
+            .unwrap();
+
+        assert_eq!(
+            layout.path_catch_volume(path, catch_time - 0.001, catch_time + 0.001),
+            1.0
+        );
+        assert_eq!(
+            layout.path_catch_volume(path, catch_time + 0.001, catch_time + 0.002),
+            0.0
+        );
+    }
+
+    #[test]
+    fn layout_reports_bounces_from_the_active_path_link() {
+        let spec = crate::siteswap::parse_config("pattern=3B").unwrap();
+        let mut matrix = crate::mhn_matrix::MhnMatrix::from_siteswap(&spec).unwrap();
+        let pattern = matrix.to_jml_pattern(&spec).unwrap();
+        let layout = LaidoutPattern::from_jml_pattern(&pattern).unwrap();
+        let (path, bounce_time) = layout
+            .path_links
+            .iter()
+            .enumerate()
+            .find_map(|(path, links)| {
+                links.iter().find_map(|link| {
+                    let PathLinkKind::Bounce(bounce) = &link.kind else {
+                        return None;
+                    };
+                    Some((path + 1, bounce.start_time + bounce.endtime[0]))
+                })
+            })
+            .unwrap();
+
+        assert_eq!(
+            layout.path_bounce_volume(path, bounce_time - 0.001, bounce_time + 0.001),
+            1.0
+        );
+        assert_eq!(
+            layout.path_bounce_volume(path, bounce_time + 0.001, bounce_time + 0.002),
+            0.0
+        );
+    }
+
+    #[test]
     fn softcatch_creates_softcatch_velocity_ref() {
         let mut pattern = MhnJmlPattern::new(1, 1, 1.0);
         pattern.symmetries.push(MhnJmlSymmetry {
@@ -2343,5 +2595,40 @@ mod tests {
         assert!(bounds.zoom_center.y.is_finite());
         assert!(bounds.zoom_center.z.is_finite());
         assert!(bounds.max.z >= SHOULDER_H + NECK_H + HEAD_H);
+    }
+
+    #[test]
+    fn overall_bounds_use_the_declared_prop_extents() {
+        let spec = parse_config("pattern=3;bps=3").unwrap();
+        let mut matrix = MhnMatrix::from_siteswap(&spec).unwrap();
+        let mut model = matrix.to_jml_pattern(&spec).unwrap();
+        model.props = vec![MhnJmlProp::new(
+            "image",
+            Some("image=ball.png;width=40".to_string()),
+        )];
+        model.prop_assignment = vec![1; model.number_of_paths];
+        let layout = LaidoutPattern::from_jml_pattern(&model).unwrap();
+
+        assert_eq!(
+            layout.prop_max,
+            Some(Coordinate {
+                x: 20.0,
+                y: 0.0,
+                z: 40.0
+            })
+        );
+        assert_eq!(
+            layout.prop_min,
+            Some(Coordinate {
+                x: -20.0,
+                y: 0.0,
+                z: 0.0
+            })
+        );
+
+        let path_bounds = layout.path_bounds(1).unwrap();
+        let overall = layout.overall_bounds().unwrap();
+        assert!(overall.max.z >= path_bounds.max.z + 40.0);
+        assert!(overall.min.x <= path_bounds.min.x - 20.0);
     }
 }

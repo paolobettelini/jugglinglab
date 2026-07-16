@@ -4,4 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+base64.workspace = true
+flate2.workspace = true
+good_lp.workspace = true
 roxmltree.workspace = true
+regex.workspace = true
+serde.workspace = true

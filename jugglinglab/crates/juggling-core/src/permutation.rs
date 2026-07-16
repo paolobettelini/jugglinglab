@@ -131,6 +131,50 @@ impl Permutation {
         Self::from_mapping(self.size, mapping, false)
     }
 
+    pub fn powered(&self, exponent: isize) -> Permutation {
+        let (mapping_len, element_for_index): (usize, fn(usize, usize) -> i32) = if self.reverses {
+            (self.size * 2 + 1, |index, size| index as i32 - size as i32)
+        } else {
+            (self.size, |index, _| index as i32 + 1)
+        };
+        let mut mapping = vec![0; mapping_len];
+        let mut visited = vec![false; mapping_len];
+
+        for start_index in 0..mapping_len {
+            if visited[start_index] {
+                continue;
+            }
+
+            let mut cycle = Vec::new();
+            let mut element = element_for_index(start_index, self.size);
+            loop {
+                let index = if self.reverses {
+                    self.reverse_index(element)
+                } else {
+                    (element - 1) as usize
+                };
+                if visited[index] {
+                    break;
+                }
+                visited[index] = true;
+                cycle.push(element);
+                element = self.map(element);
+            }
+
+            let shift = exponent.rem_euclid(cycle.len() as isize) as usize;
+            for (index, source) in cycle.iter().enumerate() {
+                let source_index = if self.reverses {
+                    self.reverse_index(*source)
+                } else {
+                    (*source - 1) as usize
+                };
+                mapping[source_index] = cycle[(index + shift) % cycle.len()];
+            }
+        }
+
+        Self::from_mapping(self.size, mapping, self.reverses)
+    }
+
     pub fn map_inverse(&self, elem: i32) -> i32 {
         if self.reverses {
             for (index, mapped) in self.mapping.iter().enumerate() {
@@ -513,6 +557,32 @@ mod tests {
         assert_eq!(perm.inverse().map(2), 1);
         assert_eq!(perm.order(), 3);
         assert_eq!(perm.cycle_of(1), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn raises_permutations_to_positive_and_negative_powers() {
+        let perm = Permutation::parse(5, "2,3,4,5,1", false).unwrap();
+
+        for exponent in -12..=12 {
+            let powered = perm.powered(exponent);
+            for element in 1..=5 {
+                assert_eq!(
+                    powered.map(element),
+                    perm.map_power(element, exponent as i32)
+                );
+            }
+        }
+
+        let reversing = Permutation::parse(2, "(1,2*)", true).unwrap();
+        for exponent in -12..=12 {
+            let powered = reversing.powered(exponent);
+            for element in -2..=2 {
+                assert_eq!(
+                    powered.map(element),
+                    reversing.map_power(element, exponent as i32)
+                );
+            }
+        }
     }
 
     #[test]

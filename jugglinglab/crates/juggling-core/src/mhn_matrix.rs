@@ -1,3 +1,4 @@
+use crate::layout::LaidoutPattern;
 use crate::mhn_hands::Coordinate;
 use crate::mhn_jml::{
     MhnJmlEvent, MhnJmlPattern, MhnJmlProp, MhnJmlSymmetry, MhnJmlTransition, MhnJmlTransitionType,
@@ -81,6 +82,11 @@ impl MhnMatrix {
         let pattern_period = spec.beats.len();
         let norep_period = lcm(lcm(pattern_period, hands_period), body_period).max(1);
         let odd_period_switchdelay = spec.vanilla_async && !spec.sync && norep_period % 2 == 1;
+        // Juggling Lab only retains a root-level explicit switch-delay when the
+        // hand/body periods do not force the parsed pattern to be wrapped and
+        // repeated. The switched throws are already present in `spec.beats`;
+        // this flag preserves the corresponding JML symmetry metadata.
+        let explicit_switchdelay = spec.switch_repeat && norep_period == pattern_period;
         let period = if odd_period_switchdelay {
             norep_period * 2
         } else {
@@ -148,7 +154,7 @@ impl MhnMatrix {
             None,
             period as isize,
         )?];
-        if odd_period_switchdelay {
+        if odd_period_switchdelay || explicit_switchdelay {
             let jug_perm = (1..=number_of_jugglers)
                 .map(|juggler| format!("({juggler},{juggler}*)"))
                 .collect::<String>();
@@ -156,7 +162,11 @@ impl MhnMatrix {
                 MhnSymmetryType::SwitchDelay,
                 number_of_jugglers,
                 Some(jug_perm),
-                (period / 2) as isize,
+                (if odd_period_switchdelay {
+                    period / 2
+                } else {
+                    pattern_period / 2
+                }) as isize,
             )?);
         }
 
@@ -355,20 +365,44 @@ impl MhnMatrix {
         self.add_juggler_positions_to_jml(spec, &timing, &mut model);
         self.add_events_for_untouched_hands_to_jml(&mut model, &hand_touched);
         self.add_events_for_untouched_paths_to_jml(&mut model, &mut path_touched);
+        let model_before_gap_events = (spec.hands.is_none()).then(|| model.clone());
         if spec.hands.is_none() {
             model.add_events_for_gaps(SECS_EVENT_GAP_MAX);
         }
-        model.add_locations_for_incomplete_events(RESTINGX)?;
-        model.merge_coincident_events();
-        model.fix_holds()?;
-        model.select_primary_events()?;
-        model.merge_coincident_events();
+        Self::finish_generated_jml(&mut model)?;
+
+        if !spec.bps_explicit {
+            let layout = LaidoutPattern::from_jml_pattern_unchecked(&model)?;
+            let scale_factor = layout.time_scale_to_fit_throws(1.01);
+            if scale_factor > 1.0 {
+                if let Some(mut model_without_gaps) = model_before_gap_events {
+                    Self::finish_generated_jml(&mut model_without_gaps)?;
+                    let layout = LaidoutPattern::from_jml_pattern_unchecked(&model_without_gaps)?;
+                    let final_scale = layout.time_scale_to_fit_throws(1.01);
+                    model = model_without_gaps.with_scaled_time(final_scale);
+                    model.add_events_for_gaps(SECS_EVENT_GAP_MAX);
+                    Self::finish_generated_jml(&mut model)?;
+                } else {
+                    model = model.with_scaled_time(scale_factor);
+                }
+            }
+        }
+
         if let Some(colors) = &spec.colors {
             model.apply_prop_colors(colors)?;
         }
         model.sort_events();
         model.rebuild_path_events();
         Ok(model)
+    }
+
+    fn finish_generated_jml(model: &mut MhnJmlPattern) -> Result<(), String> {
+        model.add_locations_for_incomplete_events(RESTINGX)?;
+        model.merge_coincident_events();
+        model.fix_holds()?;
+        model.select_primary_events()?;
+        model.merge_coincident_events();
+        Ok(())
     }
 
     fn add_props_to_jml(&self, spec: &SiteswapSpec, model: &mut MhnJmlPattern) {
@@ -1690,6 +1724,13 @@ mod tests {
     use crate::animation::parse_jml_animation;
     use crate::siteswap::parse_config;
 
+    fn trimmed_pattern_body(xml: &str) -> &str {
+        let start = xml.find("<setup").unwrap_or(0);
+        let body = &xml[start..];
+        let end = body.find("</pattern").unwrap_or(body.len());
+        &body[..end]
+    }
+
     #[test]
     fn builds_async_odd_period_switchdelay_matrix() {
         let spec = parse_config("pattern=3").unwrap();
@@ -1711,6 +1752,37 @@ mod tests {
         assert_eq!(left.target_index, 4);
         assert!(left.source.is_some());
         assert_eq!(left.path_num, 2);
+    }
+
+    #[test]
+    fn preserves_explicit_root_switchdelay_symmetry() {
+        let spec = parse_config("pattern=(2,6x)(2x,6)*").unwrap();
+        let matrix = MhnMatrix::from_siteswap(&spec).unwrap();
+
+        assert!(!matrix.odd_period_switchdelay);
+        assert_eq!(matrix.period, 8);
+        let switchdelay = matrix
+            .symmetries
+            .iter()
+            .find(|symmetry| symmetry.symmetry_type == MhnSymmetryType::SwitchDelay)
+            .unwrap();
+        assert_eq!(switchdelay.delay, 4);
+        assert_eq!(switchdelay.jug_perm.as_deref(), Some("(1,1*)"));
+    }
+
+    #[test]
+    fn leading_hand_spec_still_gets_automatic_switchdelay() {
+        let spec = parse_config("pattern=R3").unwrap();
+        let matrix = MhnMatrix::from_siteswap(&spec).unwrap();
+
+        assert!(matrix.odd_period_switchdelay);
+        assert_eq!(matrix.period, 2);
+        assert!(
+            matrix
+                .symmetries
+                .iter()
+                .any(|symmetry| symmetry.symmetry_type == MhnSymmetryType::SwitchDelay)
+        );
     }
 
     #[test]
@@ -1854,6 +1926,57 @@ mod tests {
                 .iter()
                 .any(|event| !event.transitions.is_empty())
         );
+    }
+
+    #[test]
+    fn generated_jml_matches_original_mhn_pattern_fixture() {
+        let spec = parse_config(
+            "pattern=242334;bps=5;dwell=1;hands=(25,-15)(25,-15).(25)(0).(25,65)(25,65).(0)(15).(-25,65)(12.5,20).(15)(25).",
+        )
+        .unwrap();
+        let mut matrix = MhnMatrix::from_siteswap(&spec).unwrap();
+        let model = matrix.to_jml_pattern(&spec).unwrap();
+        let expected = r#"<setup jugglers="1" paths="3" props="1,1,1"/>
+<symmetry type="delay" pperm="(1,3,2)" delay="1.2"/>
+<event x="25" y="0" z="-15" t="0" hand="1:right">
+<holding path="1"/>
+</event>
+<event x="-25" y="0" z="0" t="0" hand="1:left">
+<catch path="2"/>
+</event>
+<event x="25" y="0" z="-15" t="0.2" hand="1:right">
+<holding path="1"/>
+</event>
+<event x="-25" y="0" z="0" t="0.2" hand="1:left">
+<throw path="2" type="toss"/>
+</event>
+<event x="25" y="0" z="65" t="0.4" hand="1:right">
+<holding path="1"/>
+</event>
+<event x="0" y="0" z="0" t="0.4" hand="1:left">
+<catch path="3"/>
+</event>
+<event x="25" y="0" z="65" t="0.6" hand="1:right">
+<holding path="1"/>
+</event>
+<event x="0" y="0" z="0" t="0.6" hand="1:left">
+<throw path="3" type="toss"/>
+</event>
+<event x="-25" y="0" z="65" t="0.8" hand="1:right">
+<throw path="1" type="toss"/>
+</event>
+<event x="-15" y="0" z="0" t="0.8" hand="1:left">
+<catch path="2"/>
+</event>
+<event x="12.5" y="0" z="20" t="1" hand="1:right">
+<catch path="3"/>
+</event>
+<event x="-15" y="0" z="0" t="1" hand="1:left">
+<throw path="2" type="toss"/>
+</event>
+"#;
+
+        assert_eq!(expected, trimmed_pattern_body(&model.write_jml(true, true)));
     }
 
     #[test]

@@ -7,17 +7,26 @@ edition.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+base64.workspace = true
 console_error_panic_hook.workspace = true
+color_quant.workspace = true
+gif.workspace = true
 js-sys.workspace = true
 juggling-core = { path = "../juggling-core" }
 leptos.workspace = true
+serde_json.workspace = true
 wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
+    "AbortController",
+    "AbortSignal",
     "Blob",
+    "BlobEvent",
     "BlobPropertyBag",
     "CanvasGradient",
     "CanvasRenderingContext2d",
     "CanvasWindingRule",
+    "Clipboard",
     "Document",
     "DomRect",
     "Element",
@@ -25,15 +34,32 @@ web-sys = { workspace = true, features = [
     "File",
     "FileList",
     "FileReader",
+    "Headers",
+    "History",
     "HtmlAnchorElement",
+    "HtmlAudioElement",
     "HtmlCanvasElement",
     "HtmlImageElement",
     "HtmlInputElement",
+    "HtmlMediaElement",
+    "ImageData",
     "KeyboardEvent",
+    "MediaQueryList",
+    "MediaRecorder",
+    "MediaRecorderOptions",
+    "MediaStream",
+    "MediaStreamTrack",
+    "Navigator",
     "PointerEvent",
+    "ResizeObserver",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
     "Storage",
+    "Location",
     "Url",
     "WheelEvent",
     "Window",

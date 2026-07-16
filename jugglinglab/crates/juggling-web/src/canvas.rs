@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{
-    CanvasRenderingContext2d, CanvasWindingRule, HtmlCanvasElement, HtmlImageElement, window,
+    CanvasRenderingContext2d, CanvasWindingRule, Event, HtmlCanvasElement, HtmlImageElement, window,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +22,13 @@ pub struct RenderSettings {
     pub paused: bool,
     pub show_trails: bool,
     pub show_grid: bool,
+    pub show_title: bool,
+    pub show_axes: bool,
+    pub stereo: bool,
+    pub catch_sound: bool,
+    pub bounce_sound: bool,
+    pub border_pixels: i32,
+    pub hide_jugglers: Vec<i32>,
     pub selected_event: Option<EventSelection>,
     pub selected_position: Option<usize>,
     pub position_edit_handle: Option<PositionEditHandle>,
@@ -179,7 +186,15 @@ struct RenderCamera {
     matrix: Matrix4,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProjectedAxes {
+    x: (f64, f64),
+    y: (f64, f64),
+    z: (f64, f64),
+}
+
 const DEFAULT_BALL_RADIUS_CM: f64 = 5.0;
+const STEREO_SEPARATION_RADIANS: f64 = 0.1;
 const RING_POLYSIDES: usize = 200;
 const TRAIL_MAX_WORLD_STEP_CM: f64 = 95.0;
 const TRAIL_MAX_SCREEN_STEP_PX: f64 = 220.0;
@@ -268,13 +283,26 @@ struct Rgba {
     alpha: f64,
 }
 
+struct CachedImage {
+    image: HtmlImageElement,
+    _onload: Closure<dyn FnMut(Event)>,
+    _onerror: Closure<dyn FnMut(Event)>,
+}
+
 thread_local! {
     static ANIMATOR: RefCell<Option<CanvasAnimator>> = const { RefCell::new(None) };
+    static GROUP_ANIMATOR: RefCell<Option<CanvasAnimator>> = const { RefCell::new(None) };
     static LAST_HITS: RefCell<Vec<HitObject>> = const { RefCell::new(Vec::new()) };
     static LAST_EVENT_HITS: RefCell<Vec<EventEditorHitObject>> = const { RefCell::new(Vec::new()) };
     static LAST_POSITION_HITS: RefCell<Vec<PositionEditorHitObject>> = const { RefCell::new(Vec::new()) };
-    static IMAGE_CACHE: RefCell<HashMap<String, HtmlImageElement>> = RefCell::new(HashMap::new());
+    static IMAGE_CACHE: RefCell<HashMap<String, CachedImage>> = RefCell::new(HashMap::new());
+    static IMAGE_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static PLAYBACK_CLOCK: RefCell<PlaybackClock> = RefCell::new(PlaybackClock {
+        spec_key: None,
+        time: 0.0,
+        last_wall_ms: 0.0,
+    });
+    static GROUP_PLAYBACK_CLOCK: RefCell<PlaybackClock> = RefCell::new(PlaybackClock {
         spec_key: None,
         time: 0.0,
         last_wall_ms: 0.0,
@@ -388,6 +416,7 @@ impl Matrix4 {
 
 impl RenderCamera {
     fn for_layout(
+        viewport_left: f64,
         width: f64,
         height: f64,
         settings: &RenderSettings,
@@ -407,7 +436,7 @@ impl RenderCamera {
                 pitch: settings.camera_pitch,
                 matrix: Self::build_matrix(
                     center,
-                    width / 2.0 - zoom * center.x,
+                    viewport_left + width / 2.0 - zoom * center.x,
                     height / 2.0 + zoom * center.z,
                     zoom,
                     settings.camera_yaw,
@@ -436,8 +465,9 @@ impl RenderCamera {
         adjusted_min.x = -max_abs_x;
         adjusted_max.x = max_abs_x;
 
-        let viewport_width = (width * 0.84).max(1.0);
-        let viewport_height = (height * 0.76).max(1.0);
+        let border = settings.border_pixels.max(0) as f64;
+        let viewport_width = (width * 0.84 - 2.0 * border).max(1.0);
+        let viewport_height = (height * 0.76 - 2.0 * border).max(1.0);
         let zoom_orig = (viewport_width / (adjusted_max.x - adjusted_min.x).max(1.0))
             .min(viewport_height / (adjusted_max.z - adjusted_min.z).max(1.0))
             .clamp(0.05, 20.0);
@@ -458,7 +488,7 @@ impl RenderCamera {
             pitch: settings.camera_pitch,
             matrix: Self::build_matrix(
                 center,
-                width / 2.0 - zoom * center.x,
+                viewport_left + width / 2.0 - zoom * center.x,
                 height / 2.0 + zoom * center.z,
                 zoom,
                 settings.camera_yaw,
@@ -505,7 +535,9 @@ impl RenderCamera {
 
 impl RenderObject {
     fn prop(point: Point3, path: usize, prop: PropSpec, camera: &RenderCamera) -> Self {
-        let coord = camera.project(point);
+        let mut coord = camera.project(point);
+        coord.x = kotlin_round_to_i32(coord.x) as f64;
+        coord.y = kotlin_round_to_i32(coord.y) as f64;
         let metrics = prop_2d_metrics(&prop, camera.zoom, camera.yaw, camera.pitch);
         Self {
             kind: RenderObjectKind::Prop {
@@ -658,6 +690,7 @@ impl Bounds {
 
 pub fn start(canvas: HtmlCanvasElement, spec: AnimationSpec, settings: RenderSettings) {
     stop();
+    stop_group();
 
     let Some(win) = window() else {
         return;
@@ -689,17 +722,19 @@ pub fn start(canvas: HtmlCanvasElement, spec: AnimationSpec, settings: RenderSet
 
     let closure = Closure::wrap(Box::new(move || {
         let now_ms = js_sys::Date::now();
-        let time = PLAYBACK_CLOCK.with(|slot| {
+        let (previous_time, time) = PLAYBACK_CLOCK.with(|slot| {
             let mut clock = slot.borrow_mut();
             if clock.spec_key.as_deref() != Some(spec_key.as_str()) {
                 clock.spec_key = Some(spec_key.clone());
                 clock.time = 0.0;
             }
             let delta = ((now_ms - clock.last_wall_ms) / 1000.0).clamp(0.0, 0.25);
+            let previous_time = clock.time;
             clock.last_wall_ms = now_ms;
             clock.time += delta * settings.speed.max(0.05);
-            clock.time
+            (previous_time, clock.time)
         });
+        emit_animation_audio(&spec, &settings, previous_time, time);
         draw(&canvas, &ctx, &spec, &settings, time);
     }) as Box<dyn FnMut()>);
 
@@ -733,6 +768,93 @@ pub fn start_by_id(canvas_id: &str, spec: AnimationSpec, settings: RenderSetting
     };
 
     start(canvas, spec, settings);
+}
+
+pub fn start_group_by_ids(entries: Vec<(String, AnimationSpec, RenderSettings)>) {
+    stop();
+    stop_group();
+    let Some(win) = window() else {
+        return;
+    };
+    let Some(document) = win.document() else {
+        return;
+    };
+    let renderers = entries
+        .into_iter()
+        .filter_map(|(canvas_id, spec, settings)| {
+            let canvas = document
+                .get_element_by_id(&canvas_id)?
+                .dyn_into::<HtmlCanvasElement>()
+                .ok()?;
+            let context = canvas
+                .get_context("2d")
+                .ok()??
+                .dyn_into::<CanvasRenderingContext2d>()
+                .ok()?;
+            Some((canvas, context, spec, settings))
+        })
+        .collect::<Vec<_>>();
+    if renderers.is_empty() {
+        return;
+    }
+
+    let group_key = renderers
+        .iter()
+        .map(|(_, _, spec, _)| playback_spec_key(spec))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let now_ms = js_sys::Date::now();
+    let current_time = GROUP_PLAYBACK_CLOCK.with(|slot| {
+        let mut clock = slot.borrow_mut();
+        if clock.spec_key.as_deref() != Some(group_key.as_str()) {
+            clock.spec_key = Some(group_key.clone());
+            clock.time = 0.0;
+        }
+        clock.last_wall_ms = now_ms;
+        clock.time
+    });
+    for (canvas, context, spec, settings) in &renderers {
+        draw(canvas, context, spec, settings, current_time);
+    }
+    if renderers.iter().all(|(_, _, _, settings)| settings.paused) {
+        return;
+    }
+
+    let closure = Closure::wrap(Box::new(move || {
+        let now_ms = js_sys::Date::now();
+        let speed = renderers
+            .first()
+            .map(|(_, _, _, settings)| settings.speed.max(0.05))
+            .unwrap_or(1.0);
+        let (previous_time, time) = GROUP_PLAYBACK_CLOCK.with(|slot| {
+            let mut clock = slot.borrow_mut();
+            if clock.spec_key.as_deref() != Some(group_key.as_str()) {
+                clock.spec_key = Some(group_key.clone());
+                clock.time = 0.0;
+            }
+            let delta = ((now_ms - clock.last_wall_ms) / 1000.0).clamp(0.0, 0.25);
+            let previous_time = clock.time;
+            clock.last_wall_ms = now_ms;
+            clock.time += delta * speed;
+            (previous_time, clock.time)
+        });
+        for (canvas, context, spec, settings) in &renderers {
+            emit_animation_audio(spec, settings, previous_time, time);
+            draw(canvas, context, spec, settings, time);
+        }
+    }) as Box<dyn FnMut()>);
+
+    if let Ok(interval_id) = win.set_interval_with_callback_and_timeout_and_arguments_0(
+        closure.as_ref().unchecked_ref(),
+        16,
+    ) {
+        GROUP_ANIMATOR.with(|slot| {
+            *slot.borrow_mut() = Some(CanvasAnimator {
+                interval_id,
+                _closure: closure,
+            });
+        });
+    }
 }
 
 pub fn playback_time(spec: &AnimationSpec) -> f64 {
@@ -827,6 +949,56 @@ pub fn stop() {
     });
 }
 
+pub fn stop_group() {
+    GROUP_ANIMATOR.with(|slot| {
+        if let Some(animator) = slot.borrow_mut().take() {
+            if let Some(win) = window() {
+                win.clear_interval_with_handle(animator.interval_id);
+            }
+        }
+    });
+}
+
+fn emit_animation_audio(
+    spec: &AnimationSpec,
+    settings: &RenderSettings,
+    previous_time: f64,
+    current_time: f64,
+) {
+    if !settings.catch_sound && !settings.bounce_sound {
+        return;
+    }
+    let AnimationKind::Jml(jml) = &spec.kind else {
+        return;
+    };
+    let Some(layout) = &jml.layout else {
+        return;
+    };
+    let period = jml.period_secs;
+    if !period.is_finite() || period <= 0.0 {
+        return;
+    }
+    let current = current_time.rem_euclid(period);
+    let mut previous = previous_time.rem_euclid(period);
+    if current < previous {
+        previous -= period;
+    }
+    for path in 1..=layout.number_of_paths {
+        if settings.catch_sound {
+            let volume = layout.path_catch_volume(path, previous, current);
+            if volume > 0.0 {
+                crate::audio::play_catch(volume);
+            }
+        }
+        if settings.bounce_sound {
+            let volume = layout.path_bounce_volume(path, previous, current);
+            if volume > 0.0 {
+                crate::audio::play_bounce(volume);
+            }
+        }
+    }
+}
+
 fn draw(
     canvas: &HtmlCanvasElement,
     ctx: &CanvasRenderingContext2d,
@@ -837,6 +1009,41 @@ fn draw(
     let (width, height, dpr) = resize_canvas(canvas);
     ctx.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
 
+    draw_frame(ctx, spec, settings, time, width, height);
+}
+
+pub fn render_export_frame(
+    canvas: &HtmlCanvasElement,
+    spec: &AnimationSpec,
+    settings: &RenderSettings,
+    time: f64,
+    width: u32,
+    height: u32,
+    scale: u32,
+) -> Result<(), String> {
+    let scale = scale.max(1);
+    canvas.set_width(width.saturating_mul(scale));
+    canvas.set_height(height.saturating_mul(scale));
+    let ctx = canvas
+        .get_context("2d")
+        .map_err(|_| "Unable to create animation export canvas".to_string())?
+        .ok_or_else(|| "2D canvas is unavailable for animation export".to_string())?
+        .dyn_into::<CanvasRenderingContext2d>()
+        .map_err(|_| "Unable to create animation export canvas".to_string())?;
+    ctx.set_transform(scale as f64, 0.0, 0.0, scale as f64, 0.0, 0.0)
+        .map_err(|_| "Unable to scale animation export canvas".to_string())?;
+    draw_frame(&ctx, spec, settings, time, width as f64, height as f64);
+    Ok(())
+}
+
+fn draw_frame(
+    ctx: &CanvasRenderingContext2d,
+    spec: &AnimationSpec,
+    settings: &RenderSettings,
+    time: f64,
+    width: f64,
+    height: f64,
+) {
     let palette = Palette::for_theme(&settings.theme);
     LAST_HITS.with(|hits| hits.borrow_mut().clear());
     LAST_EVENT_HITS.with(|hits| hits.borrow_mut().clear());
@@ -864,8 +1071,37 @@ fn draw(
         }
     }
 
-    draw_hud(ctx, spec, width, &palette);
-    draw_axes(ctx, settings, &palette);
+    if settings.show_title {
+        draw_hud(ctx, spec, width, &palette);
+    }
+    if !settings.show_axes {
+        return;
+    }
+    if settings.stereo {
+        let half_width = width / 2.0;
+        draw_axes(
+            ctx,
+            settings.camera_yaw - STEREO_SEPARATION_RADIANS / 2.0,
+            settings.camera_pitch,
+            0.0,
+            &palette,
+        );
+        draw_axes(
+            ctx,
+            settings.camera_yaw + STEREO_SEPARATION_RADIANS / 2.0,
+            settings.camera_pitch,
+            half_width,
+            &palette,
+        );
+    } else {
+        draw_axes(
+            ctx,
+            settings.camera_yaw,
+            settings.camera_pitch,
+            0.0,
+            &palette,
+        );
+    }
 }
 
 fn resize_canvas(canvas: &HtmlCanvasElement) -> (f64, f64, f64) {
@@ -908,17 +1144,103 @@ fn draw_jml_layout_scene(
     let Some(layout) = &jml.layout else {
         return;
     };
+    if settings.stereo {
+        let viewport_width = width / 2.0;
+        let mut left_settings = settings.clone();
+        left_settings.camera_yaw -= STEREO_SEPARATION_RADIANS / 2.0;
+        let mut right_settings = settings.clone();
+        right_settings.camera_yaw += STEREO_SEPARATION_RADIANS / 2.0;
+        let left_camera = RenderCamera::for_layout(
+            0.0,
+            viewport_width,
+            height,
+            &left_settings,
+            layout.overall_bounds(),
+            jml.jugglers,
+        );
+        let right_camera = RenderCamera::for_layout(
+            viewport_width,
+            viewport_width,
+            height,
+            &right_settings,
+            layout.overall_bounds(),
+            jml.jugglers,
+        );
+        let position_drag_axes = settings.selected_position.and_then(|position_index| {
+            average_projected_axes(
+                position_editor_axes(left_camera, jml, position_index),
+                position_editor_axes(right_camera, jml, position_index),
+            )
+        });
+        draw_jml_layout_view(
+            ctx,
+            0.0,
+            viewport_width,
+            height,
+            jml,
+            &left_settings,
+            palette,
+            time,
+            left_camera,
+            Some((left_camera, right_camera)),
+            position_drag_axes,
+        );
+        draw_jml_layout_view(
+            ctx,
+            viewport_width,
+            viewport_width,
+            height,
+            jml,
+            &right_settings,
+            palette,
+            time,
+            right_camera,
+            Some((left_camera, right_camera)),
+            position_drag_axes,
+        );
+    } else {
+        let camera = RenderCamera::for_layout(
+            0.0,
+            width,
+            height,
+            settings,
+            layout.overall_bounds(),
+            jml.jugglers,
+        );
+        draw_jml_layout_view(
+            ctx, 0.0, width, height, jml, settings, palette, time, camera, None, None,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_jml_layout_view(
+    ctx: &CanvasRenderingContext2d,
+    viewport_left: f64,
+    width: f64,
+    height: f64,
+    jml: &JmlAnimation,
+    settings: &RenderSettings,
+    palette: &Palette,
+    time: f64,
+    camera: RenderCamera,
+    event_stereo_cameras: Option<(RenderCamera, RenderCamera)>,
+    position_drag_axes: Option<ProjectedAxes>,
+) {
+    let Some(layout) = &jml.layout else {
+        return;
+    };
+    ctx.save();
+    ctx.begin_path();
+    ctx.rect(viewport_left, 0.0, width, height);
+    ctx.clip();
     let t = time.rem_euclid(jml.period_secs);
     let mut objects = Vec::new();
-    let camera = RenderCamera::for_layout(
-        width,
-        height,
-        settings,
-        layout.overall_bounds(),
-        jml.jugglers,
-    );
 
     for jug in 1..=jml.jugglers {
+        if settings.hide_jugglers.contains(&(jug as i32)) {
+            continue;
+        }
         if let Ok(frame) = layout.juggler_frame(jug, t) {
             push_juggler_render_objects(&mut objects, &frame, jug, &camera);
             push_juggler_frame_hits(&frame, jug, &camera);
@@ -946,14 +1268,14 @@ fn draw_jml_layout_scene(
     }
 
     if settings.selected_position.is_some() && camera.pitch < 70.0_f64.to_radians() {
-        draw_position_grid(ctx, &camera, width, height, palette);
+        draw_position_grid(ctx, &camera, viewport_left, width, height, palette);
     }
 
     for index in sorted_render_order(&mut objects) {
         draw_render_object(ctx, &objects[index], palette);
     }
     if let Some(selection) = settings.selected_event {
-        draw_event_editor(ctx, &camera, jml, selection, palette);
+        draw_event_editor(ctx, &camera, jml, selection, event_stereo_cameras, palette);
     }
     if let Some(position_index) = settings.selected_position {
         draw_position_editor(
@@ -962,9 +1284,11 @@ fn draw_jml_layout_scene(
             jml,
             position_index,
             settings.position_edit_handle,
+            position_drag_axes,
             palette,
         );
     }
+    ctx.restore();
 }
 
 fn draw_event_editor(
@@ -972,6 +1296,7 @@ fn draw_event_editor(
     camera: &RenderCamera,
     jml: &JmlAnimation,
     selection: EventSelection,
+    stereo_cameras: Option<(RenderCamera, RenderCamera)>,
     palette: &Palette,
 ) {
     const EVENT_BOX_HALF_CM: f64 = 5.0;
@@ -1042,15 +1367,38 @@ fn draw_event_editor(
             .juggler_angle(event.event.juggler, event.event.t)
             .unwrap_or(0.0)
             .to_radians();
-        let (axis_x, _, axis_z) = event_projected_axes(*camera, center_world, angle);
-        draw_event_xz_box(
-            ctx,
-            camera.project(center_world),
+        let (axis_x, axis_y, axis_z) = event_projected_axes(*camera, center_world, angle);
+        let drag_axes = event_drag_axes(
+            jml,
+            EventSelection {
+                primary_index: event.primary_index,
+                time: event.event.t,
+            },
             axis_x,
+            axis_y,
             axis_z,
-            NEIGHBOR_BOX_HALF_CM,
-            palette,
+            stereo_cameras,
         );
+        let center = camera.project(center_world);
+        let corners = event_xz_corners(center, axis_x, axis_z, NEIGHBOR_BOX_HALF_CM);
+        draw_event_xz_box(ctx, center, axis_x, axis_z, NEIGHBOR_BOX_HALF_CM, palette);
+        LAST_EVENT_HITS.with(|hits| {
+            hits.borrow_mut().push(EventEditorHitObject {
+                hit: EventEditorHit {
+                    primary_index: event.primary_index,
+                    event_time: event.event.t,
+                    image_hand: event.event.hand,
+                    handle: EventEditHandle::Xz,
+                    local_x_dx: drag_axes.x.0,
+                    local_x_dy: drag_axes.x.1,
+                    local_y_dx: drag_axes.y.0,
+                    local_y_dy: drag_axes.y.1,
+                    z_dx: drag_axes.z.0,
+                    z_dy: drag_axes.z.1,
+                },
+                shape: HitShape::Polygon(corners.to_vec()),
+            });
+        });
     }
 
     let center_world = point_from_coordinate(selected.global_coordinate);
@@ -1063,17 +1411,18 @@ fn draw_event_editor(
     let xz_area = (axis_x.0 * axis_z.1 - axis_x.1 * axis_z.0).abs();
     let show_xz = xz_area > 0.015;
     let show_y = axis_y.0.hypot(axis_y.1) > 0.08;
+    let drag_axes = event_drag_axes(jml, selection, axis_x, axis_y, axis_z, stereo_cameras);
     let geometry = EventEditorHit {
         primary_index: selection.primary_index,
         event_time: selected.event.t,
         image_hand: selected.event.hand,
         handle: EventEditHandle::Xz,
-        local_x_dx: axis_x.0,
-        local_x_dy: axis_x.1,
-        local_y_dx: axis_y.0,
-        local_y_dy: axis_y.1,
-        z_dx: axis_z.0,
-        z_dy: axis_z.1,
+        local_x_dx: drag_axes.x.0,
+        local_x_dy: drag_axes.x.1,
+        local_y_dx: drag_axes.y.0,
+        local_y_dy: drag_axes.y.1,
+        z_dx: drag_axes.z.0,
+        z_dy: drag_axes.z.1,
     };
 
     ctx.set_fill_style_str(palette.highlight);
@@ -1190,6 +1539,101 @@ fn event_projected_axes(
         projected_axis(camera, center, local_y),
         projected_axis(camera, center, world_z),
     )
+}
+
+fn event_drag_axes(
+    jml: &JmlAnimation,
+    selection: EventSelection,
+    axis_x: (f64, f64),
+    axis_y: (f64, f64),
+    axis_z: (f64, f64),
+    stereo_cameras: Option<(RenderCamera, RenderCamera)>,
+) -> ProjectedAxes {
+    stereo_cameras
+        .and_then(|(left, right)| {
+            average_projected_axes(
+                event_editor_axes(left, jml, selection),
+                event_editor_axes(right, jml, selection),
+            )
+        })
+        .unwrap_or(ProjectedAxes {
+            x: axis_x,
+            y: axis_y,
+            z: axis_z,
+        })
+}
+
+fn event_editor_axes(
+    camera: RenderCamera,
+    jml: &JmlAnimation,
+    selection: EventSelection,
+) -> Option<ProjectedAxes> {
+    let layout = jml.layout.as_ref()?;
+    let selected_index = selected_layout_event_index(layout, selection, jml.period_secs)?;
+    let selected = &layout.events[selected_index];
+    let center = point_from_coordinate(selected.global_coordinate);
+    let angle = layout
+        .juggler_angle(selected.event.juggler, selected.event.t)
+        .ok()?
+        .to_radians();
+    let (x, y, z) = event_projected_axes(camera, center, angle);
+    Some(ProjectedAxes { x, y, z })
+}
+
+fn position_editor_axes(
+    camera: RenderCamera,
+    jml: &JmlAnimation,
+    position_index: usize,
+) -> Option<ProjectedAxes> {
+    let position = jml.positions.get(position_index)?;
+    let angle = position.angle.to_radians();
+    let center = Point3 {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+    };
+    Some(ProjectedAxes {
+        x: projected_axis(
+            camera,
+            center,
+            Point3 {
+                x: angle.cos(),
+                y: angle.sin(),
+                z: 0.0,
+            },
+        ),
+        y: projected_axis(
+            camera,
+            center,
+            Point3 {
+                x: -angle.sin(),
+                y: angle.cos(),
+                z: 0.0,
+            },
+        ),
+        z: projected_axis(
+            camera,
+            center,
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+        ),
+    })
+}
+
+fn average_projected_axes(
+    left: Option<ProjectedAxes>,
+    right: Option<ProjectedAxes>,
+) -> Option<ProjectedAxes> {
+    let (left, right) = (left?, right?);
+    let average = |a: (f64, f64), b: (f64, f64)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    Some(ProjectedAxes {
+        x: average(left.x, right.x),
+        y: average(left.y, right.y),
+        z: average(left.z, right.z),
+    })
 }
 
 fn event_xz_corners(
@@ -1344,6 +1788,7 @@ fn draw_dashed_segment(
 fn draw_position_grid(
     ctx: &CanvasRenderingContext2d,
     camera: &RenderCamera,
+    viewport_left: f64,
     width: f64,
     height: f64,
     palette: &Palette,
@@ -1376,7 +1821,12 @@ fn draw_position_grid(
     let mut m_max = i32::MIN;
     let mut n_min = i32::MAX;
     let mut n_max = i32::MIN;
-    for (x, y) in [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)] {
+    for (x, y) in [
+        (viewport_left, 0.0),
+        (viewport_left + width, 0.0),
+        (viewport_left, height),
+        (viewport_left + width, height),
+    ] {
         let Some((m, n)) = solve_screen_vectors(
             x - origin.x,
             y - origin.y,
@@ -1462,6 +1912,7 @@ fn draw_position_editor(
     jml: &JmlAnimation,
     position_index: usize,
     active_handle: Option<PositionEditHandle>,
+    drag_axes: Option<ProjectedAxes>,
     palette: &Palette,
 ) {
     const BOX_HALF_CM: f64 = 10.0;
@@ -1504,7 +1955,12 @@ fn draw_position_editor(
     let draw_xy = show_xy || dragging;
     let draw_z = show_z && (!dragging || active_handle == Some(PositionEditHandle::Z));
     let draw_angle = show_angle && (!dragging || active_handle == Some(PositionEditHandle::Angle));
-    let geometry = PositionEditorHit {
+    let drag_axes = drag_axes.unwrap_or(ProjectedAxes {
+        x: axis_x,
+        y: axis_y,
+        z: axis_z,
+    });
+    let eye_geometry = PositionEditorHit {
         position_index,
         handle: PositionEditHandle::Xy,
         center_x: center.x,
@@ -1515,6 +1971,18 @@ fn draw_position_editor(
         local_y_dy: axis_y.1,
         z_dx: axis_z.0,
         z_dy: axis_z.1,
+    };
+    let geometry = PositionEditorHit {
+        position_index,
+        handle: PositionEditHandle::Xy,
+        center_x: center.x,
+        center_y: center.y,
+        local_x_dx: drag_axes.x.0,
+        local_x_dy: drag_axes.x.1,
+        local_y_dx: drag_axes.y.0,
+        local_y_dy: drag_axes.y.1,
+        z_dx: drag_axes.z.0,
+        z_dy: drag_axes.z.1,
     };
 
     ctx.set_stroke_style_str(palette.highlight);
@@ -1587,7 +2055,7 @@ fn draw_position_editor(
         ctx.line_to(angle_end.0, angle_end.1);
         ctx.stroke();
         draw_editor_handle(ctx, angle_end.0, angle_end.1, 5.0);
-        let mut hit = geometry.clone();
+        let mut hit = eye_geometry;
         hit.handle = PositionEditHandle::Angle;
         LAST_POSITION_HITS.with(|hits| {
             hits.borrow_mut().push(PositionEditorHitObject {
@@ -2009,24 +2477,70 @@ fn cached_image(source: &str) -> Option<HtmlImageElement> {
     let url = image_source_url(source);
     IMAGE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(image) = cache.get(&url) {
-            return Some(image.clone());
+        if let Some(cached) = cache.get(&url) {
+            return Some(cached.image.clone());
         }
         let image = HtmlImageElement::new().ok()?;
+        if requires_anonymous_cors(&url) {
+            image.set_cross_origin(Some("anonymous"));
+        }
+        let onload = Closure::wrap(Box::new(move |_event: Event| {
+            notify_image_cache_changed();
+        }) as Box<dyn FnMut(Event)>);
+        let failed_source = source.to_string();
+        let onerror = Closure::wrap(Box::new(move |_event: Event| {
+            IMAGE_ERRORS.with(|errors| {
+                let mut errors = errors.borrow_mut();
+                if !errors.iter().any(|source| source == &failed_source) {
+                    errors.push(failed_source.clone());
+                }
+            });
+            notify_image_cache_changed();
+        }) as Box<dyn FnMut(Event)>);
+        image.set_onload(Some(onload.as_ref().unchecked_ref()));
+        image.set_onerror(Some(onerror.as_ref().unchecked_ref()));
         image.set_src(&url);
-        cache.insert(url, image.clone());
+        cache.insert(
+            url,
+            CachedImage {
+                image: image.clone(),
+                _onload: onload,
+                _onerror: onerror,
+            },
+        );
         Some(image)
     })
+}
+
+fn notify_image_cache_changed() {
+    let Some(window) = window() else {
+        return;
+    };
+    let Ok(event) = Event::new("jugglinglab-image-cache") else {
+        return;
+    };
+    window.dispatch_event(&event).ok();
+}
+
+pub fn take_image_errors() -> Vec<String> {
+    IMAGE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
 }
 
 fn image_source_url(source: &str) -> String {
     let decoded = source.trim().replace("%3B", ";").replace("%3b", ";");
     let trimmed = decoded.as_str();
-    if trimmed.contains('/') || trimmed.starts_with("data:") {
+    if trimmed.contains('/') || trimmed.starts_with("data:") || trimmed.starts_with("blob:") {
         trimmed.to_string()
     } else {
         format!("./assets/{trimmed}")
     }
+}
+
+fn requires_anonymous_cors(url: &str) -> bool {
+    let normalized = url.trim().to_ascii_lowercase();
+    normalized.starts_with("http://")
+        || normalized.starts_with("https://")
+        || normalized.starts_with("//")
 }
 
 fn draw_highlight_layers(
@@ -2274,15 +2788,12 @@ fn push_trail_render_objects(
     }
 }
 
-fn draw_hud(ctx: &CanvasRenderingContext2d, spec: &AnimationSpec, width: f64, palette: &Palette) {
+fn draw_hud(ctx: &CanvasRenderingContext2d, spec: &AnimationSpec, _width: f64, palette: &Palette) {
     ctx.save();
     ctx.set_fill_style_str(palette.text_muted);
     ctx.set_font("12px Inter, system-ui, sans-serif");
     let label = format!("{} | {} prop", spec.title, spec.ball_count);
     ctx.fill_text(&label, 88.0, 28.0).ok();
-    ctx.set_global_alpha(0.16);
-    ctx.set_fill_style_str(palette.figure);
-    ctx.fill_rect(width - 104.0, 20.0, 82.0, 2.0);
     ctx.restore();
 }
 
@@ -2307,13 +2818,17 @@ fn draw_unavailable_message(
     ctx.restore();
 }
 
-fn draw_axes(ctx: &CanvasRenderingContext2d, settings: &RenderSettings, palette: &Palette) {
-    let theta = settings.camera_yaw;
-    let phi = settings.camera_pitch;
+fn draw_axes(
+    ctx: &CanvasRenderingContext2d,
+    theta: f64,
+    phi: f64,
+    viewport_left: f64,
+    palette: &Palette,
+) {
     let axis_len = 30.0;
     let xy_len = axis_len * phi.cos();
     let z_len = axis_len * phi.sin();
-    let cx = 38.0;
+    let cx = viewport_left + 38.0;
     let cy = 48.0;
     let xx = cx - axis_len * theta.cos();
     let xy = cy + xy_len * theta.sin();
@@ -2400,26 +2915,28 @@ fn prop_2d_metrics(prop: &PropSpec, zoom: f64, yaw: f64, pitch: f64) -> Prop2DMe
 
 fn ball_prop_metrics(diameter: f64, zoom: f64) -> Prop2DMetrics {
     let pixel_size = prop_pixel_size(diameter, zoom);
+    let center = (pixel_size / 2.0).trunc();
     Prop2DMetrics {
         width: pixel_size,
         height: pixel_size,
-        center_x: pixel_size / 2.0,
-        center_y: pixel_size / 2.0,
-        grip_x: pixel_size / 2.0,
-        grip_y: pixel_size / 2.0,
+        center_x: center,
+        center_y: center,
+        grip_x: center,
+        grip_y: center,
         shape: Prop2DShape::Ball,
     }
 }
 
 fn square_prop_metrics(diameter: f64, zoom: f64) -> Prop2DMetrics {
     let pixel_size = prop_pixel_size(diameter, zoom);
+    let center = (pixel_size / 2.0).trunc();
     Prop2DMetrics {
         width: pixel_size,
         height: pixel_size,
-        center_x: pixel_size / 2.0,
-        center_y: pixel_size / 2.0,
-        grip_x: pixel_size / 2.0,
-        grip_y: pixel_size / 2.0,
+        center_x: center,
+        center_y: center,
+        grip_x: center,
+        grip_y: center,
         shape: Prop2DShape::Square,
     }
 }
@@ -2430,19 +2947,30 @@ fn image_prop_metrics(prop: &PropSpec, zoom: f64) -> Prop2DMetrics {
         .clone()
         .unwrap_or_else(|| "ball.png".to_string());
     let width_cm = prop.diameter;
-    let height_cm = width_cm
-        * loaded_image_aspect_ratio(&source).unwrap_or_else(|| {
-            prop.image_aspect_ratio
-                .unwrap_or_else(|| default_image_aspect_ratio(&source))
-        });
+    let aspect_ratio = loaded_image_aspect_ratio(&source).unwrap_or_else(|| {
+        prop.image_aspect_ratio
+            .unwrap_or_else(|| default_image_aspect_ratio(&source))
+    });
+    image_prop_metrics_for_aspect(source, width_cm, aspect_ratio, zoom)
+}
+
+fn image_prop_metrics_for_aspect(
+    source: String,
+    width_cm: f64,
+    aspect_ratio: f64,
+    zoom: f64,
+) -> Prop2DMetrics {
+    let height_cm = width_cm * aspect_ratio;
     let pixel_width = prop_pixel_size(width_cm, zoom);
     let pixel_height = prop_pixel_size(height_cm, zoom);
+    let center_x = (pixel_width / 2.0).trunc();
+    let center_y = (pixel_height / 2.0).trunc();
     Prop2DMetrics {
         width: pixel_width,
         height: pixel_height,
-        center_x: pixel_width / 2.0,
-        center_y: pixel_height / 2.0,
-        grip_x: pixel_width / 2.0,
+        center_x,
+        center_y,
+        grip_x: center_x,
         grip_y: pixel_height,
         shape: Prop2DShape::Image { source },
     }
@@ -2533,8 +3061,8 @@ fn ring_prop_metrics(
     Prop2DMetrics {
         width: bbwidth,
         height: bbheight,
-        center_x: bbwidth / 2.0,
-        center_y: bbheight / 2.0,
+        center_x: (bbwidth / 2.0).trunc(),
+        center_y: (bbheight / 2.0).trunc(),
         grip_x,
         grip_y,
         shape: Prop2DShape::Ring { outer, inner },
@@ -2591,6 +3119,10 @@ fn ring_polygon(
 
 fn original_round(value: f64) -> i32 {
     (value + 0.5) as i32
+}
+
+fn kotlin_round_to_i32(value: f64) -> i32 {
+    (value + 0.5).floor() as i32
 }
 
 fn trace_polygon(
@@ -2859,5 +3391,67 @@ impl Palette {
 
     fn ball(&self, seed: usize) -> &'static str {
         self.balls[seed % self.balls.len()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prop_metrics_use_original_integer_centers_and_grips() {
+        let ball = ball_prop_metrics(11.0, 1.0);
+        assert_eq!(ball.width, 11.0);
+        assert_eq!(ball.center_x, 5.0);
+        assert_eq!(ball.center_y, 5.0);
+        assert_eq!(ball.grip_x, 5.0);
+        assert_eq!(ball.grip_y, 5.0);
+
+        let image = image_prop_metrics_for_aspect("ball.png".to_string(), 11.0, 1.0, 1.0);
+        assert_eq!(image.width, 11.0);
+        assert_eq!(image.center_x, 5.0);
+        assert_eq!(image.grip_x, 5.0);
+        assert_eq!(image.grip_y, 11.0);
+    }
+
+    #[test]
+    fn prop_anchor_rounding_matches_kotlin_round_to_int() {
+        assert_eq!(kotlin_round_to_i32(1.49), 1);
+        assert_eq!(kotlin_round_to_i32(1.5), 2);
+        assert_eq!(kotlin_round_to_i32(-1.49), -1);
+        assert_eq!(kotlin_round_to_i32(-1.5), -1);
+        assert_eq!(kotlin_round_to_i32(-1.51), -2);
+    }
+
+    #[test]
+    fn external_images_request_cors_without_changing_local_or_embedded_sources() {
+        assert!(requires_anonymous_cors("https://example.com/prop.png"));
+        assert!(requires_anonymous_cors("//cdn.example.com/prop.png"));
+        assert!(!requires_anonymous_cors("./assets/ball.png"));
+        assert!(!requires_anonymous_cors("data:image/png;base64,AAAA"));
+        assert!(!requires_anonymous_cors("blob:http://localhost/id"));
+    }
+
+    #[test]
+    fn stereo_drag_axes_are_the_mean_of_both_views() {
+        let left = ProjectedAxes {
+            x: (2.0, -4.0),
+            y: (6.0, 8.0),
+            z: (0.0, -10.0),
+        };
+        let right = ProjectedAxes {
+            x: (4.0, -2.0),
+            y: (10.0, 4.0),
+            z: (2.0, -6.0),
+        };
+
+        assert_eq!(
+            average_projected_axes(Some(left), Some(right)),
+            Some(ProjectedAxes {
+                x: (3.0, -3.0),
+                y: (8.0, 6.0),
+                z: (1.0, -8.0),
+            })
+        );
     }
 }
