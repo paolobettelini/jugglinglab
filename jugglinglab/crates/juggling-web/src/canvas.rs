@@ -248,6 +248,8 @@ enum RenderObjectKind {
     Line {
         juggler: usize,
         body_depth_delta: Option<f64>,
+        joint_start: bool,
+        joint_end: bool,
     },
     Trail {
         alpha: f64,
@@ -594,6 +596,8 @@ impl RenderObject {
             kind: RenderObjectKind::Line {
                 juggler,
                 body_depth_delta: None,
+                joint_start: false,
+                joint_end: false,
             },
             bounds: Bounds::from_points(&coords, 4.0),
             coords,
@@ -607,6 +611,8 @@ impl RenderObject {
         end: Coordinate,
         body: &RenderObject,
         camera: &RenderCamera,
+        joint_start: bool,
+        joint_end: bool,
     ) -> Self {
         let coords = [start, end]
             .into_iter()
@@ -617,6 +623,8 @@ impl RenderObject {
             kind: RenderObjectKind::Line {
                 juggler,
                 body_depth_delta: arm_segment_body_depth_delta(body, &coords),
+                joint_start,
+                joint_end,
             },
             bounds: Bounds::from_points(&coords, 4.0),
             coords,
@@ -2236,10 +2244,12 @@ fn push_arm_render_objects(
     camera: &RenderCamera,
 ) {
     if let Some(elbow) = elbow {
-        push_arm_segment_render_objects(objects, juggler, shoulder, elbow, body, camera);
-        push_arm_segment_render_objects(objects, juggler, elbow, hand, body, camera);
+        push_arm_segment_render_objects(
+            objects, juggler, shoulder, elbow, body, camera, true, true,
+        );
+        push_arm_segment_render_objects(objects, juggler, elbow, hand, body, camera, false, true);
     } else {
-        push_arm_segment_render_objects(objects, juggler, shoulder, hand, body, camera);
+        push_arm_segment_render_objects(objects, juggler, shoulder, hand, body, camera, true, true);
     }
 }
 
@@ -2250,17 +2260,35 @@ fn push_arm_segment_render_objects(
     end: Coordinate,
     body: &RenderObject,
     camera: &RenderCamera,
+    joint_start: bool,
+    joint_end: bool,
 ) {
     let start_screen = camera.project(point_from_coordinate(start));
     let end_screen = camera.project(point_from_coordinate(end));
     if let Some(t) = arm_plane_crossing_parameter(body, start_screen, end_screen) {
         let crossing = interpolate_coordinate(start, end, t);
         objects.push(RenderObject::arm_line(
-            juggler, start, crossing, body, camera,
+            juggler,
+            start,
+            crossing,
+            body,
+            camera,
+            joint_start,
+            false,
         ));
-        objects.push(RenderObject::arm_line(juggler, crossing, end, body, camera));
+        objects.push(RenderObject::arm_line(
+            juggler, crossing, end, body, camera, false, joint_end,
+        ));
     } else {
-        objects.push(RenderObject::arm_line(juggler, start, end, body, camera));
+        objects.push(RenderObject::arm_line(
+            juggler,
+            start,
+            end,
+            body,
+            camera,
+            joint_start,
+            joint_end,
+        ));
     }
 }
 
@@ -2403,8 +2431,20 @@ fn draw_render_object(ctx: &CanvasRenderingContext2d, object: &RenderObject, pal
                 object.bounds.bottom,
             );
         }
-        RenderObjectKind::Line { juggler, .. } => {
-            draw_line_object(ctx, &object.coords, *juggler, palette);
+        RenderObjectKind::Line {
+            juggler,
+            joint_start,
+            joint_end,
+            ..
+        } => {
+            draw_line_object(
+                ctx,
+                &object.coords,
+                *juggler,
+                *joint_start,
+                *joint_end,
+                palette,
+            );
             if *juggler > 0 && object.coords.len() >= 2 {
                 push_segment_hit(
                     &format!("Juggler {juggler} arm"),
@@ -2797,6 +2837,8 @@ fn draw_line_object(
     ctx: &CanvasRenderingContext2d,
     coords: &[ScreenPoint],
     juggler: usize,
+    joint_start: bool,
+    joint_end: bool,
     palette: &Palette,
 ) {
     if coords.len() < 2 {
@@ -2819,7 +2861,10 @@ fn draw_line_object(
     ctx.stroke();
 
     if juggler > 0 {
-        for point in coords {
+        for (point, draw_joint) in [(&coords[0], joint_start), (&coords[1], joint_end)] {
+            if !draw_joint {
+                continue;
+            }
             ctx.begin_path();
             ctx.arc(point.x, point.y, 3.2, 0.0, std::f64::consts::TAU)
                 .ok();
@@ -3390,6 +3435,7 @@ fn box_covering_line(box_object: &RenderObject, line_object: &RenderObject) -> i
         RenderObjectKind::Line {
             juggler: line_juggler,
             body_depth_delta: Some(depth_delta),
+            ..
         },
     ) = (&box_object.kind, &line_object.kind)
     {
@@ -3616,6 +3662,8 @@ mod tests {
             kind: RenderObjectKind::Line {
                 juggler: 1,
                 body_depth_delta: None,
+                joint_start: false,
+                joint_end: false,
             },
             coords: vec![start, end],
             bounds: Bounds::from_points(&[start, end], 0.0),
@@ -3628,6 +3676,8 @@ mod tests {
             kind: RenderObjectKind::Line {
                 juggler: 1,
                 body_depth_delta: Some(body_depth_delta),
+                joint_start: true,
+                joint_end: true,
             },
             coords: vec![start, end],
             bounds: Bounds::from_points(&[start, end], 0.0),
@@ -3677,6 +3727,41 @@ mod tests {
     }
 
     #[test]
+    fn depth_split_does_not_create_an_anatomical_joint() {
+        let body = test_body_box();
+        let camera = test_camera(Matrix4::identity());
+        let mut segments = Vec::new();
+        push_arm_segment_render_objects(
+            &mut segments,
+            1,
+            test_coordinate(5.0, -10.0, 5.0),
+            test_coordinate(5.0, 10.0, 5.0),
+            &body,
+            &camera,
+            true,
+            true,
+        );
+
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(
+            segments[0].kind,
+            RenderObjectKind::Line {
+                joint_start: true,
+                joint_end: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            segments[1].kind,
+            RenderObjectKind::Line {
+                joint_start: false,
+                joint_end: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn rotating_behind_the_juggler_reverses_the_complete_arm_body_order() {
         let frame = test_juggler_frame();
         let front_camera = test_camera(Matrix4::identity());
@@ -3699,7 +3784,8 @@ mod tests {
                         object.kind,
                         RenderObjectKind::Line {
                             juggler: 1,
-                            body_depth_delta: Some(_)
+                            body_depth_delta: Some(_),
+                            ..
                         }
                     )
                 })

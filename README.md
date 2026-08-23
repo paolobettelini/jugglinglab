@@ -37,9 +37,10 @@ See the original project for the upstream source code, history, and contributor 
 
 ## Build
 
-In development mode, the assets are embedded into the executable.
+In release mode, the assets are embedded into the executable.
 
 ```bash
+cd jugglinglab
 cargo leptos build --release
-cargo run -p juggling-server -- --address 0.0.0.0 --port 8080
+cargo run -p juggling-server --release -- --address 0.0.0.0 --port 8080
 ```
