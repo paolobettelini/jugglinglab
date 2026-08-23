@@ -127,6 +127,16 @@ pub struct LadderDiagram {
     pub transitions: Vec<LadderTransition>,
     pub positions: Vec<LadderPosition>,
     pub edges: Vec<LadderEdge>,
+    constraint_events: Vec<LadderConstraintEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LadderConstraintEvent {
+    primary_index: usize,
+    time: f64,
+    juggler: usize,
+    hand: LadderHand,
+    transitions: Vec<LadderEventTransition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,6 +387,30 @@ pub fn build_ladder_diagram(jml: &JmlAnimation) -> LadderDiagram {
             })
             .collect(),
         edges,
+        constraint_events: jml
+            .all_event_images
+            .iter()
+            .map(|image| {
+                let (juggler, hand) = parse_event_hand(&image.event.hand);
+                LadderConstraintEvent {
+                    primary_index: image.primary_index,
+                    time: image.event.t,
+                    juggler,
+                    hand,
+                    transitions: image
+                        .event
+                        .transitions
+                        .iter()
+                        .map(|transition| LadderEventTransition {
+                            path: transition.path,
+                            transition: transition.kind,
+                            throw_type: transition.throw_type.clone(),
+                            throw_mod: transition.throw_mod.clone(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -555,9 +589,9 @@ impl LadderDiagram {
         let mut max_time: f64 = period_secs;
 
         for other in self
-            .events
+            .constraint_events
             .iter()
-            .filter(|other| other.event_index != event.event_index)
+            .filter(|other| other.primary_index != event.event_index)
             .filter(|other| {
                 other.transitions.iter().any(|transition| {
                     transition.is_throw_or_catch() && event_paths.contains(&transition.path)
@@ -577,13 +611,21 @@ impl LadderDiagram {
 
         loop {
             let mut changed = false;
-            for other in self.events.iter().filter(|other| {
-                other.event_index != event.event_index
+            for other in self.constraint_events.iter().filter(|other| {
+                other.primary_index != event.event_index
                     && other.juggler == event.juggler
                     && other.hand == event.hand
             }) {
-                let separation = if (other.has_throw() && event.has_throw_or_catch())
-                    || (other.has_throw_or_catch() && event.has_throw())
+                let other_has_throw = other
+                    .transitions
+                    .iter()
+                    .any(|transition| transition.transition == TransitionKind::Throw);
+                let other_has_throw_or_catch = other
+                    .transitions
+                    .iter()
+                    .any(LadderEventTransition::is_throw_or_catch);
+                let separation = if (other_has_throw && event.has_throw_or_catch())
+                    || (other_has_throw_or_catch && event.has_throw())
                 {
                     MIN_THROW_SEP_TIME
                 } else {
@@ -901,6 +943,31 @@ mod tests {
         let constrained = diagram.constrain_event_time("event-1", 0.5).unwrap();
 
         assert!((constrained - 0.47).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ladder_event_constraints_include_images_across_the_period_boundary() {
+        let xml = r#"
+        <jml version="3">
+        <pattern>
+        <setup jugglers="1" paths="0"/>
+        <symmetry type="delay" pperm="" delay="1"/>
+        <event x="0" y="0" z="0" t="0.05" hand="1:right"/>
+        <event x="0" y="0" z="0" t="0.995" hand="1:right"/>
+        </pattern>
+        </jml>
+        "#;
+        let jml = parse_jml_animation(xml).unwrap();
+        let diagram = build_ladder_diagram(&jml);
+        let event = diagram
+            .events
+            .iter()
+            .find(|event| (event.time - 0.05).abs() < 1e-9)
+            .unwrap();
+
+        let constrained = diagram.constrain_event_time(&event.id, 0.0).unwrap();
+
+        assert!((constrained - 0.005).abs() < 1e-9);
     }
 
     #[test]

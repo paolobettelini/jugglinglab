@@ -483,8 +483,24 @@ mod tests {
         ];
 
         let xml = write_pattern_list_document(Some("Favorites"), Some("Personal list"), &records);
-        assert!(xml.contains("<line display=\"Section\"/>"));
-        assert!(xml.contains("<info>Personal list</info>"));
+        assert_eq!(
+            xml,
+            r#"<?xml version="1.0"?>
+<!DOCTYPE jml SYSTEM "file://jml.dtd">
+<jml version="3">
+<patternlist>
+<title>Favorites</title>
+<info>Personal list</info>
+
+<line display="Section"/>
+
+<line display="Cascade" notation="siteswap">
+pattern=3
+</line>
+</patternlist>
+</jml>
+"#
+        );
 
         let parsed = parse_jml(&xml).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("Favorites"));

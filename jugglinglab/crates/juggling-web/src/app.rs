@@ -50,6 +50,8 @@ const LADDER_DESKTOP_RADIUS_UNITS: f64 = 2.0;
 const PATTERN_SOURCE_BASE: &str = "base";
 const PATTERN_SOURCE_JML: &str = "jml";
 const HISTORY_LIMIT: usize = 64;
+const CANVAS_MIN_ZOOM: f64 = 0.35;
+const CANVAS_MAX_ZOOM: f64 = 4.0;
 const CAMERA_SNAP_ANGLE: f64 = 8.0_f64.to_radians();
 const CAMERA_MIN_PITCH: f64 = 0.0001_f64.to_radians();
 const CAMERA_MAX_PITCH: f64 = 179.9999_f64.to_radians();
@@ -471,6 +473,13 @@ struct LadderTouch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct CanvasTouch {
+    pointer_id: i32,
+    client_x: f64,
+    client_y: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct LadderScrollDrag {
     pointer_id: i32,
     start_client_y: f64,
@@ -529,15 +538,9 @@ struct DefinePropDraft {
 
 #[derive(Clone, Debug, PartialEq)]
 enum LadderDragKind {
-    Event {
-        primary_index: usize,
-        primary_time: f64,
-    },
+    Event { primary_index: usize },
     Position(usize),
-    Tracker {
-        was_playing: bool,
-        prop_cycle: i64,
-    },
+    Tracker { was_playing: bool, prop_cycle: i64 },
 }
 
 #[component]
@@ -634,6 +637,8 @@ pub fn App() -> impl IntoView {
     let (redo_stack, set_redo_stack) = signal(Vec::<EditorSnapshot>::new());
     let (view_drag_start, set_view_drag_start) = signal(None::<(f64, f64)>);
     let (view_drag_camera, set_view_drag_camera) = signal(None::<(f64, f64)>);
+    let (_canvas_touches, set_canvas_touches) = signal(Vec::<CanvasTouch>::new());
+    let (canvas_pinch_distance, set_canvas_pinch_distance) = signal(None::<f64>);
     let (event_canvas_drag, set_event_canvas_drag) = signal(None::<EventCanvasDrag>);
     let (position_canvas_drag, set_position_canvas_drag) = signal(None::<PositionCanvasDrag>);
     let (view_dragged, set_view_dragged) = signal(false);
@@ -705,6 +710,19 @@ pub fn App() -> impl IntoView {
         })
     });
 
+    let base_pattern_edited = Memo::new(move |_| {
+        current_record
+            .get()
+            .as_ref()
+            .is_some_and(record_base_pattern_is_edited)
+    });
+
+    let pattern_text_dirty = Memo::new(move |_| {
+        current_record.get().as_ref().is_some_and(|record| {
+            pattern_text.get() != record_text_for_source(record, &pattern_source.get())
+        })
+    });
+
     let prop_colors_available = Memo::new(move |_| {
         current_record
             .get()
@@ -750,7 +768,7 @@ pub fn App() -> impl IntoView {
             .get()
             .unwrap_or_else(|| current_spec.get());
         if view_mode.get() == "selection" {
-            let entries = selection_records
+            let entries: Vec<(String, AnimationSpec, RenderSettings)> = selection_records
                 .get()
                 .into_iter()
                 .enumerate()
@@ -785,7 +803,24 @@ pub fn App() -> impl IntoView {
                     ))
                 })
                 .collect();
-            canvas::start_group_by_ids(entries);
+            if entries.is_empty() {
+                canvas::stop_group();
+                return;
+            }
+            let fallback_entries = entries.clone();
+            let callback = Closure::once_into_js(move || {
+                if view_mode.get_untracked() == "selection" {
+                    canvas::start_group_by_ids(entries);
+                }
+            });
+            let scheduled = window().is_some_and(|window| {
+                window
+                    .request_animation_frame(callback.unchecked_ref())
+                    .is_ok()
+            });
+            if !scheduled && view_mode.get_untracked() == "selection" {
+                canvas::start_group_by_ids(fallback_entries);
+            }
             return;
         }
         let settings = RenderSettings {
@@ -1634,6 +1669,35 @@ pub fn App() -> impl IntoView {
             canvas.focus().ok();
             canvas.set_pointer_capture(event.pointer_id()).ok();
         }
+        if event.pointer_type() == "touch" {
+            let touch = CanvasTouch {
+                pointer_id: event.pointer_id(),
+                client_x: event.client_x() as f64,
+                client_y: event.client_y() as f64,
+            };
+            let mut active = Vec::new();
+            set_canvas_touches.update(|touches| {
+                if let Some(existing) = touches
+                    .iter_mut()
+                    .find(|existing| existing.pointer_id == touch.pointer_id)
+                {
+                    *existing = touch;
+                } else {
+                    touches.push(touch);
+                }
+                active = touches.clone();
+            });
+            if active.len() >= 2 {
+                set_canvas_pinch_distance.set(canvas_touch_distance(&active));
+                set_event_canvas_drag.set(None);
+                set_position_canvas_drag.set(None);
+                set_view_drag_start.set(None);
+                set_view_drag_camera.set(None);
+                set_view_dragged.set(true);
+                set_status.set("Pinch to zoom".to_string());
+                return;
+            }
+        }
         if let Some(hit) = canvas::event_editor_hit_by_id(
             "juggling-stage",
             event.client_x() as f64,
@@ -1650,7 +1714,7 @@ pub fn App() -> impl IntoView {
                     }
                     set_selected_object.set(format!(
                         "J{} {} event",
-                        start_primary.juggler,
+                        hit.image_juggler,
                         if hit.image_hand == 0 { "right" } else { "left" }
                     ));
                     set_event_canvas_drag.set(Some(EventCanvasDrag {
@@ -1711,6 +1775,38 @@ pub fn App() -> impl IntoView {
     };
 
     let drag_canvas_view = move |event: ev::PointerEvent| {
+        if event.pointer_type() == "touch" {
+            let mut active = Vec::new();
+            set_canvas_touches.update(|touches| {
+                if let Some(touch) = touches
+                    .iter_mut()
+                    .find(|touch| touch.pointer_id == event.pointer_id())
+                {
+                    touch.client_x = event.client_x() as f64;
+                    touch.client_y = event.client_y() as f64;
+                }
+                active = touches.clone();
+            });
+            if let (Some(previous_distance), Some(distance)) = (
+                canvas_pinch_distance.get_untracked(),
+                canvas_touch_distance(&active),
+            ) {
+                event.prevent_default();
+                set_zoom.set(canvas_zoom_from_pinch(
+                    zoom.get_untracked(),
+                    previous_distance,
+                    distance,
+                ));
+                set_canvas_pinch_distance.set(Some(distance));
+                set_event_canvas_drag.set(None);
+                set_position_canvas_drag.set(None);
+                set_view_drag_start.set(None);
+                set_view_drag_camera.set(None);
+                set_view_dragged.set(true);
+                set_status.set("Zoom adjusted".to_string());
+                return;
+            }
+        }
         if let Some(mut drag) = event_canvas_drag.get_untracked() {
             event.prevent_default();
             let dx = event.client_x() as f64 - drag.start_client_x;
@@ -1812,12 +1908,38 @@ pub fn App() -> impl IntoView {
 
     let end_canvas_drag = move |event: ev::PointerEvent| {
         event.prevent_default();
-        if let Some(canvas) = window()
-            .and_then(|window| window.document())
-            .and_then(|document| document.get_element_by_id("juggling-stage"))
+        if let Some(canvas) = event
+            .current_target()
+            .and_then(|target| target.dyn_into::<HtmlCanvasElement>().ok())
         {
             if canvas.has_pointer_capture(event.pointer_id()) {
                 canvas.release_pointer_capture(event.pointer_id()).ok();
+            }
+        }
+        if event.pointer_type() == "touch" {
+            let was_pinching = canvas_pinch_distance.get_untracked().is_some();
+            let mut active = Vec::new();
+            set_canvas_touches.update(|touches| {
+                touches.retain(|touch| touch.pointer_id != event.pointer_id());
+                active = touches.clone();
+            });
+            if was_pinching {
+                set_canvas_pinch_distance.set(canvas_touch_distance(&active));
+                set_event_canvas_drag.set(None);
+                set_position_canvas_drag.set(None);
+                if let Some(touch) = active.first() {
+                    set_view_drag_start.set(Some((touch.client_x, touch.client_y)));
+                    set_view_drag_camera.set(Some((
+                        camera_yaw.get_untracked(),
+                        camera_pitch.get_untracked(),
+                    )));
+                } else {
+                    set_view_drag_start.set(None);
+                    set_view_drag_camera.set(None);
+                }
+                set_view_dragged.set(true);
+                set_status.set("Zoom adjusted".to_string());
+                return;
             }
         }
         if let Some(drag) = event_canvas_drag.get_untracked() {
@@ -1849,7 +1971,7 @@ pub fn App() -> impl IntoView {
         event.prevent_default();
         let factor = (-event.delta_y() * 0.0012).exp();
         set_zoom.update(|zoom| {
-            *zoom = (*zoom * factor).clamp(0.35, 4.0);
+            *zoom = (*zoom * factor).clamp(CANVAS_MIN_ZOOM, CANVAS_MAX_ZOOM);
         });
         set_status.set("Zoom adjusted".to_string());
     };
@@ -2028,6 +2150,33 @@ pub fn App() -> impl IntoView {
             .and_then(|target| target.dyn_into::<HtmlCanvasElement>().ok())
         {
             canvas.set_pointer_capture(event.pointer_id()).ok();
+        }
+        if event.pointer_type() == "touch" {
+            let touch = CanvasTouch {
+                pointer_id: event.pointer_id(),
+                client_x: event.client_x() as f64,
+                client_y: event.client_y() as f64,
+            };
+            let mut active = Vec::new();
+            set_canvas_touches.update(|touches| {
+                if let Some(existing) = touches
+                    .iter_mut()
+                    .find(|existing| existing.pointer_id == touch.pointer_id)
+                {
+                    *existing = touch;
+                } else {
+                    touches.push(touch);
+                }
+                active = touches.clone();
+            });
+            if active.len() >= 2 {
+                set_canvas_pinch_distance.set(canvas_touch_distance(&active));
+                set_view_drag_start.set(None);
+                set_view_drag_camera.set(None);
+                set_view_dragged.set(true);
+                set_status.set("Pinch to zoom".to_string());
+                return;
+            }
         }
         set_view_drag_start.set(Some((event.client_x() as f64, event.client_y() as f64)));
         set_view_drag_camera.set(Some((
@@ -2321,13 +2470,11 @@ pub fn App() -> impl IntoView {
             } else {
                 let preview = current_record.get_untracked().and_then(|record| {
                     let edited = match &drag.kind {
-                        LadderDragKind::Event {
-                            primary_index,
-                            primary_time,
-                        } => move_ladder_event_in_record(
+                        LadderDragKind::Event { primary_index } => move_ladder_event_in_record(
                             &record,
                             *primary_index,
-                            *primary_time + time - drag.start_time,
+                            drag.start_time,
+                            time,
                         ),
                         LadderDragKind::Position(position_index) => {
                             move_ladder_position_in_record(&record, *position_index, time)
@@ -2438,13 +2585,17 @@ pub fn App() -> impl IntoView {
         }
 
         let selected_id = drag.selected_id.clone();
+        let moved_event_anchor = match &drag.kind {
+            LadderDragKind::Event { .. } => diagram
+                .events
+                .iter()
+                .find(|event| event.id == drag.selected_id)
+                .map(|event| (event.juggler, event.hand, time)),
+            _ => None,
+        };
         let edit_result = match drag.kind {
-            LadderDragKind::Event {
-                primary_index,
-                primary_time,
-            } => {
-                let new_primary_time = primary_time + time - drag.start_time;
-                move_ladder_event_in_record(&record, primary_index, new_primary_time)
+            LadderDragKind::Event { primary_index } => {
+                move_ladder_event_in_record(&record, primary_index, drag.start_time, time)
             }
             LadderDragKind::Position(position_index) => {
                 move_ladder_position_in_record(&record, position_index, time)
@@ -2454,8 +2605,11 @@ pub fn App() -> impl IntoView {
 
         match edit_result {
             Ok(edited) => {
+                let resolved_id = moved_event_anchor.and_then(|(juggler, hand, target_time)| {
+                    ladder_event_id_for_record(&edited, juggler, hand, target_time)
+                });
                 commit_ladder_record(edited);
-                set_selected_ladder.set(selected_id);
+                set_selected_ladder.set(resolved_id.unwrap_or(selected_id));
                 set_status.set(format!("Moved ladder item to {time:.3}s"));
             }
             Err(err) => set_status.set(err),
@@ -2765,9 +2919,19 @@ pub fn App() -> impl IntoView {
             });
 
         match add_ladder_event_in_record(&record, &spec, target.juggler, hand, target.time) {
-            Ok((edited, event_index)) => {
+            Ok((edited, _event_index)) => {
+                let selected_id = ladder_event_id_for_record(
+                    &edited,
+                    target.juggler,
+                    if hand == 1 {
+                        LadderHand::Left
+                    } else {
+                        LadderHand::Right
+                    },
+                    target.time,
+                );
                 commit_ladder_record(edited);
-                set_selected_ladder.set(format!("event-{}", event_index + 1));
+                set_selected_ladder.set(selected_id.unwrap_or_default());
                 set_status.set(format!(
                     "Added {} event for juggler {} at {:.3}s",
                     if hand == 1 { "left" } else { "right" },
@@ -2965,8 +3129,9 @@ pub fn App() -> impl IntoView {
             target,
         ) {
             Ok(edited) => {
+                let resolved_id = ladder_transition_id_for_record(&edited, &transition);
                 commit_ladder_record(edited);
-                set_selected_ladder.set(String::new());
+                set_selected_ladder.set(resolved_id.unwrap_or(selected_id));
                 set_status.set("Catch style changed".to_string());
             }
             Err(err) => set_status.set(err),
@@ -2992,8 +3157,9 @@ pub fn App() -> impl IntoView {
             transition.transition_index,
         ) {
             Ok(edited) => {
+                let resolved_id = ladder_transition_id_for_record(&edited, &transition);
                 commit_ladder_record(edited);
-                set_selected_ladder.set(String::new());
+                set_selected_ladder.set(resolved_id.unwrap_or(selected_id));
                 set_status.set("Transition moved to end of event".to_string());
             }
             Err(err) => set_status.set(err),
@@ -3196,7 +3362,12 @@ pub fn App() -> impl IntoView {
                         "About"
                     </button>
                 </div>
-                <div class="status-line">{move || status.get()}</div>
+                <div
+                    class="status-line"
+                    role="status"
+                    aria-live="polite"
+                    aria-atomic="true"
+                >{move || status.get()}</div>
             </header>
 
             <section class="jl-workbench">
@@ -3579,6 +3750,13 @@ pub fn App() -> impl IntoView {
                                         on:change=move |_| choose_pattern_source(PATTERN_SOURCE_BASE)
                                     />
                                     " Base pattern"
+                                    {move || base_pattern_edited.get().then(|| view! {
+                                        <span
+                                            class="pattern-edited-indicator"
+                                            title="The generated pattern contains structured edits"
+                                            aria-label="Base pattern edited"
+                                        >"!"</span>
+                                    })}
                                 </label>
                                 <label>
                                     <input
@@ -3596,8 +3774,20 @@ pub fn App() -> impl IntoView {
                                 on:input=move |ev| set_pattern_text.set(event_target_value(&ev))
                             ></textarea>
                             <div class="button-row">
-                                <button type="button" on:click=compile_pattern_text>"Compile"</button>
-                                <button type="button" on:click=revert_pattern_text>"Revert"</button>
+                                <button
+                                    type="button"
+                                    prop:disabled=move || {
+                                        !pattern_text_dirty.get()
+                                            && !(pattern_source.get() == PATTERN_SOURCE_BASE
+                                                && base_pattern_edited.get())
+                                    }
+                                    on:click=compile_pattern_text
+                                >"Compile"</button>
+                                <button
+                                    type="button"
+                                    prop:disabled=move || !pattern_text_dirty.get()
+                                    on:click=revert_pattern_text
+                                >"Revert"</button>
                             </div>
                         </div>
                         <aside class="graph-panel">
@@ -4106,7 +4296,6 @@ pub fn App() -> impl IntoView {
                                                         set_ladder_drag.set(Some(LadderDrag {
                                                             kind: LadderDragKind::Event {
                                                                 primary_index: event_index,
-                                                                primary_time: event.primary_time,
                                                             },
                                                             pointer_id: pointer_event.pointer_id(),
                                                             selected_id: drag_event_id.clone(),
@@ -4398,7 +4587,7 @@ pub fn App() -> impl IntoView {
                                     <progress max=total.max(1) value=completed></progress>
                                     <span>{format!("{completed} / {total}")}</span>
                                 </div>
-                                <div class=error_class>{dialog.error.unwrap_or_default()}</div>
+                                <div class=error_class role="alert">{dialog.error.unwrap_or_default()}</div>
                             </div>
                             <div class="dialog-actions">
                                 <button type="button" on:click=cancel_animation_export>
@@ -5334,8 +5523,56 @@ fn record_text_for_source(record: &PatternRecord, source: &str) -> String {
     if source == PATTERN_SOURCE_JML {
         record_to_pattern_jml(record).unwrap_or_else(|_| record_text(record))
     } else {
-        record.config.clone().unwrap_or_else(|| record_text(record))
+        record
+            .config
+            .as_deref()
+            .map(format_base_pattern_text)
+            .unwrap_or_else(|| record_text(record))
     }
+}
+
+fn format_base_pattern_text(config: &str) -> String {
+    let mut formatted = String::with_capacity(config.len());
+    let mut chars = config.chars().peekable();
+    while let Some(ch) = chars.next() {
+        formatted.push(ch);
+        if ch != ';' {
+            continue;
+        }
+        while chars.peek().is_some_and(|next| next.is_whitespace()) {
+            chars.next();
+        }
+        formatted.push('\n');
+    }
+    formatted
+}
+
+fn record_base_pattern_is_edited(record: &PatternRecord) -> bool {
+    let Ok(current_xml) = record_to_pattern_jml(record) else {
+        return false;
+    };
+    let Ok(current_model) = MhnJmlPattern::from_jml_xml(&current_xml) else {
+        return false;
+    };
+    let (Some(notation), Some(config)) = (
+        current_model.base_pattern_notation.as_deref(),
+        current_model.base_pattern_config.as_deref(),
+    ) else {
+        return false;
+    };
+    if !notation.eq_ignore_ascii_case("siteswap") {
+        return false;
+    }
+
+    let base_record = PatternRecord::siteswap(record.display.clone(), config.to_string());
+    let Ok(base_xml) = record_to_pattern_jml(&base_record) else {
+        return false;
+    };
+    let Ok(base_model) = MhnJmlPattern::from_jml_xml(&base_xml) else {
+        return false;
+    };
+
+    current_model.write_jml(true, false) != base_model.write_jml(true, false)
 }
 
 fn parse_editor_jml(text: &str) -> Result<jml::PatternLibrary, String> {
@@ -5555,7 +5792,9 @@ fn event_drag_sources(
         .events
         .iter()
         .filter(|event| {
-            event.primary_index == hit.primary_index && event.event.hand == hit.image_hand
+            event.primary_index == hit.primary_index
+                && event.event.juggler == hit.image_juggler
+                && event.event.hand == hit.image_hand
         })
         .min_by(|left, right| {
             cyclic_time_distance(left.event.t, hit.event_time, jml.period_secs).total_cmp(
@@ -5836,18 +6075,17 @@ fn is_camera_key(key: &str) -> bool {
 fn move_ladder_event_in_record(
     record: &PatternRecord,
     event_index: usize,
-    time: f64,
+    image_time: f64,
+    target_time: f64,
 ) -> Result<PatternRecord, String> {
     let xml = record_to_pattern_jml(record)?;
     let mut model = MhnJmlPattern::from_jml_xml(&xml)?;
-    if event_index >= model.events.len() {
-        return Err("Selected ladder event is no longer available".to_string());
-    }
-
     let period_secs = model.period_secs.max(0.1);
-    model.events[event_index].t = time.rem_euclid(period_secs);
-    model.sort_events();
-    model.rebuild_path_events();
+    model.move_event_image_to_time(
+        event_index,
+        image_time.rem_euclid(period_secs),
+        target_time.rem_euclid(period_secs),
+    )?;
     record_from_edited_jml_model(record, model, "Ladder edit rejected")
 }
 
@@ -7032,6 +7270,24 @@ fn ladder_touch_distance(touches: &[LadderTouch]) -> Option<f64> {
     )
 }
 
+fn canvas_touch_distance(touches: &[CanvasTouch]) -> Option<f64> {
+    let [first, second, ..] = touches else {
+        return None;
+    };
+    Some(
+        ((first.client_x - second.client_x).powi(2) + (first.client_y - second.client_y).powi(2))
+            .sqrt(),
+    )
+}
+
+fn canvas_zoom_from_pinch(zoom: f64, previous_distance: f64, distance: f64) -> f64 {
+    if !previous_distance.is_finite() || !distance.is_finite() || previous_distance <= f64::EPSILON
+    {
+        return zoom.clamp(CANVAS_MIN_ZOOM, CANVAS_MAX_ZOOM);
+    }
+    (zoom * distance / previous_distance).clamp(CANVAS_MIN_ZOOM, CANVAS_MAX_ZOOM)
+}
+
 fn ladder_touch_centroid_y(touches: &[LadderTouch]) -> Option<f64> {
     (!touches.is_empty())
         .then(|| touches.iter().map(|touch| touch.client_y).sum::<f64>() / touches.len() as f64)
@@ -7418,6 +7674,8 @@ fn selected_ladder_event_selection(
         return Some(canvas::EventSelection {
             primary_index: event.event_index,
             time: event.time,
+            juggler: event.juggler,
+            hand: if event.hand == LadderHand::Left { 1 } else { 0 },
         });
     }
     diagram
@@ -7427,6 +7685,12 @@ fn selected_ladder_event_selection(
         .map(|transition| canvas::EventSelection {
             primary_index: transition.event_index,
             time: transition.time,
+            juggler: transition.juggler,
+            hand: if transition.hand == LadderHand::Left {
+                1
+            } else {
+                0
+            },
         })
 }
 
@@ -7443,13 +7707,59 @@ fn ladder_event_id_for_editor_hit(
     diagram
         .events
         .iter()
-        .filter(|event| event.event_index == hit.primary_index && event.hand == hand)
+        .filter(|event| {
+            event.event_index == hit.primary_index
+                && event.juggler == hit.image_juggler
+                && event.hand == hand
+        })
         .min_by(|left, right| {
             cyclic_time_distance(left.time, hit.event_time, diagram.period_secs).total_cmp(
                 &cyclic_time_distance(right.time, hit.event_time, diagram.period_secs),
             )
         })
         .map(|event| event.id.clone())
+}
+
+fn ladder_event_id_for_record(
+    record: &PatternRecord,
+    juggler: usize,
+    hand: LadderHand,
+    time: f64,
+) -> Option<String> {
+    let spec = AnimationSpec::from_record(record).ok()?;
+    let diagram = ladder_diagram(&spec)?;
+    diagram
+        .events
+        .iter()
+        .filter(|event| event.juggler == juggler && event.hand == hand)
+        .min_by(|left, right| {
+            cyclic_time_distance(left.time, time, diagram.period_secs)
+                .total_cmp(&cyclic_time_distance(right.time, time, diagram.period_secs))
+        })
+        .map(|event| event.id.clone())
+}
+
+fn ladder_transition_id_for_record(
+    record: &PatternRecord,
+    anchor: &LadderTransition,
+) -> Option<String> {
+    let spec = AnimationSpec::from_record(record).ok()?;
+    let diagram = ladder_diagram(&spec)?;
+    diagram
+        .transitions
+        .iter()
+        .filter(|transition| {
+            transition.event_index == anchor.event_index
+                && transition.juggler == anchor.juggler
+                && transition.hand == anchor.hand
+                && transition.path == anchor.path
+        })
+        .min_by(|left, right| {
+            cyclic_time_distance(left.time, anchor.time, diagram.period_secs).total_cmp(
+                &cyclic_time_distance(right.time, anchor.time, diagram.period_secs),
+            )
+        })
+        .map(|transition| transition.id.clone())
 }
 
 fn selected_ladder_position_index(spec: &AnimationSpec, selected_id: &str) -> Option<usize> {
@@ -7878,14 +8188,14 @@ async fn request_generation(
     arguments: String,
     controller: AbortController,
 ) -> Result<GenerationResult, String> {
-    request_pattern_search("/api/generate", "Generator", arguments, controller).await
+    request_pattern_search("api/generate", "Generator", arguments, controller).await
 }
 
 async fn request_transition(
     arguments: String,
     controller: AbortController,
 ) -> Result<GenerationResult, String> {
-    request_pattern_search("/api/transition", "Transitioner", arguments, controller).await
+    request_pattern_search("api/transition", "Transitioner", arguments, controller).await
 }
 
 async fn request_pattern_search(
@@ -8137,6 +8447,27 @@ mod tests {
     }
 
     #[test]
+    fn canvas_pinch_scales_and_clamps_the_camera_zoom() {
+        let touches = [
+            CanvasTouch {
+                pointer_id: 1,
+                client_x: 10.0,
+                client_y: 20.0,
+            },
+            CanvasTouch {
+                pointer_id: 2,
+                client_x: 16.0,
+                client_y: 28.0,
+            },
+        ];
+
+        assert!((canvas_touch_distance(&touches).unwrap() - 10.0).abs() < 1e-12);
+        assert_eq!(canvas_zoom_from_pinch(1.0, 10.0, 20.0), 2.0);
+        assert_eq!(canvas_zoom_from_pinch(3.0, 10.0, 20.0), CANVAS_MAX_ZOOM);
+        assert_eq!(canvas_zoom_from_pinch(0.5, 10.0, 1.0), CANVAS_MIN_ZOOM);
+    }
+
+    #[test]
     fn ladder_path_hit_distance_uses_the_nearest_segment_or_arc() {
         let line = LadderShape::Line(LadderSegment {
             x1: 10.0,
@@ -8156,6 +8487,110 @@ mod tests {
     }
 
     #[test]
+    fn dense_multiplex_transitions_use_distinct_original_slots() {
+        let spec = AnimationSpec::from_record(&PatternRecord::siteswap(
+            "Triple multiplex",
+            "pattern=[333]",
+        ))
+        .unwrap();
+        let diagram = ladder_diagram(&spec).unwrap();
+        let event = diagram
+            .events
+            .iter()
+            .max_by_key(|event| event.transitions.len())
+            .unwrap();
+        assert!(event.transitions.len() >= 3);
+
+        let metrics = LadderViewMetrics {
+            transition_radius: 2.0,
+            position_radius: 2.0,
+        };
+        let xs = diagram
+            .transitions
+            .iter()
+            .filter(|transition| {
+                transition.event_index == event.event_index
+                    && transition.juggler == event.juggler
+                    && transition.hand == event.hand
+                    && (transition.time - event.time).abs() < 1e-9
+            })
+            .map(|transition| ladder_transition_x(&diagram, transition, metrics))
+            .collect::<Vec<_>>();
+        assert_eq!(xs.len(), event.transitions.len());
+        for pair in xs.windows(2) {
+            let step = match event.hand {
+                LadderHand::Left => pair[1] - pair[0],
+                LadderHand::Right => pair[0] - pair[1],
+            };
+            assert!((step - 4.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn self_throw_arc_preserves_endpoints_and_bulges_toward_the_juggler_center() {
+        let spec =
+            AnimationSpec::from_record(&PatternRecord::siteswap("Four", "pattern=4")).unwrap();
+        let diagram = ladder_diagram(&spec).unwrap();
+        let edge = diagram
+            .edges
+            .iter()
+            .find(|edge| edge.is_self_throw())
+            .unwrap();
+        let metrics = LadderViewMetrics {
+            transition_radius: 2.0,
+            position_radius: 2.0,
+        };
+        let x1 = ladder_endpoint_x(&diagram, &edge.start, metrics);
+        let y1 = ladder_absolute_time_y(&diagram, edge.start.time, 1.0);
+        let x2 = ladder_endpoint_x(&diagram, &edge.end, metrics);
+        let y2 = ladder_absolute_time_y(&diagram, edge.end_time_absolute, 1.0);
+        let points = ladder_self_throw_points(&diagram, edge, x1, y1, x2, y2).unwrap();
+
+        assert_eq!(points.len(), 25);
+        assert!((points[0].0 - x1).abs() < 1e-9);
+        assert!((points[0].1 - y1).abs() < 1e-9);
+        assert!((points[24].0 - x2).abs() < 1e-9);
+        assert!((points[24].1 - y2).abs() < 1e-9);
+        let center = ladder_position_x(&diagram, edge.end.juggler);
+        let chord_mid_x = 0.5 * (x1 + x2);
+        assert!((points[12].0 - center).abs() < (chord_mid_x - center).abs());
+        assert!(points.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
+    }
+
+    #[test]
+    fn eight_juggler_tracks_match_the_original_dimensionless_spacing() {
+        let record = PatternRecord::siteswap("Eight jugglers", "pattern=<3|3|3|3|3|3|3|3>");
+        let spec = AnimationSpec::from_record(&record).unwrap();
+        let diagram = ladder_diagram(&spec).unwrap();
+        assert_eq!(diagram.tracks.len(), 16);
+
+        let width_units = 2.0 * LADDER_BORDER_SIDES + 8.0 + 7.0 * LADDER_JUGGLER_SEPARATION;
+        for juggler in 1..=8 {
+            let left = diagram
+                .tracks
+                .iter()
+                .find(|track| track.juggler == juggler && track.hand == LadderHand::Left)
+                .unwrap();
+            let right = diagram
+                .tracks
+                .iter()
+                .find(|track| track.juggler == juggler && track.hand == LadderHand::Right)
+                .unwrap();
+            let base_units =
+                LADDER_BORDER_SIDES + (juggler - 1) as f64 * (1.0 + LADDER_JUGGLER_SEPARATION);
+            assert!(
+                (ladder_track_x(&diagram, left.index) - 100.0 * base_units / width_units).abs()
+                    < 1e-12
+            );
+            assert!(
+                (ladder_track_x(&diagram, right.index) - 100.0 * (base_units + 1.0) / width_units)
+                    .abs()
+                    < 1e-12
+            );
+        }
+    }
+
+    #[test]
     fn canvas_event_hit_resolves_the_matching_ladder_event_image() {
         let spec =
             AnimationSpec::from_record(&PatternRecord::siteswap("Cascade", "pattern=3")).unwrap();
@@ -8164,6 +8599,7 @@ mod tests {
         let hit = canvas::EventEditorHit {
             primary_index: event.event_index,
             event_time: event.time,
+            image_juggler: event.juggler,
             image_hand: match event.hand {
                 LadderHand::Left => 1,
                 LadderHand::Right => 0,
@@ -8181,6 +8617,131 @@ mod tests {
             ladder_event_id_for_editor_hit(&spec, &hit).as_deref(),
             Some(event.id.as_str())
         );
+    }
+
+    #[test]
+    fn canvas_event_hit_distinguishes_same_time_multi_juggler_images() {
+        let xml = r#"
+        <jml version="3">
+        <pattern>
+        <title>Passing symmetry selection</title>
+        <setup jugglers="2" paths="0"/>
+        <symmetry type="delay" pperm="" delay="1"/>
+        <symmetry type="switch" jperm="(1,2)" pperm=""/>
+        <event x="10" y="0" z="0" t="0.25" hand="1:right"/>
+        </pattern>
+        </jml>
+        "#;
+        let record = jml::parse_jml(xml).unwrap().records.remove(0);
+        let spec = AnimationSpec::from_record(&record).unwrap();
+        let diagram = ladder_diagram(&spec).unwrap();
+        let event = diagram
+            .events
+            .iter()
+            .find(|event| event.juggler == 2)
+            .unwrap();
+        let hit = canvas::EventEditorHit {
+            primary_index: event.event_index,
+            event_time: event.time,
+            image_juggler: event.juggler,
+            image_hand: 0,
+            handle: canvas::EventEditHandle::Xz,
+            local_x_dx: 0.0,
+            local_x_dy: 0.0,
+            local_y_dx: 0.0,
+            local_y_dy: 0.0,
+            z_dx: 0.0,
+            z_dy: 0.0,
+        };
+
+        assert_eq!(
+            ladder_event_id_for_editor_hit(&spec, &hit).as_deref(),
+            Some(event.id.as_str())
+        );
+        assert_eq!(
+            selected_ladder_event_selection(&spec, &event.id)
+                .unwrap()
+                .juggler,
+            2
+        );
+    }
+
+    #[test]
+    fn moved_ladder_event_keeps_selection_after_crossing_and_reordering() {
+        let xml = r#"
+        <jml version="3">
+        <pattern>
+        <title>Holding edit</title>
+        <prop type="ball"/>
+        <setup jugglers="1" paths="1" props="1"/>
+        <symmetry type="delay" pperm="1" delay="2"/>
+        <event x="15" y="0" z="0" t="0" hand="1:right"><catch path="1"/></event>
+        <event x="-15" y="0" z="0" t="0" hand="1:left"/>
+        <event x="20" y="0" z="0" t="0.5" hand="1:right"><holding path="1"/></event>
+        <event x="25" y="0" z="0" t="1" hand="1:right"><throw path="1" type="toss"/></event>
+        <event x="-15" y="0" z="0" t="1" hand="1:left"/>
+        </pattern>
+        </jml>
+        "#;
+        let record = jml::parse_jml(xml).unwrap().records.remove(0);
+        let spec = AnimationSpec::from_record(&record).unwrap();
+        let diagram = ladder_diagram(&spec).unwrap();
+        let selected = diagram
+            .events
+            .iter()
+            .find(|event| event.hand == LadderHand::Right && (event.time - 0.5).abs() < 1e-9)
+            .unwrap();
+        let old_id = selected.id.clone();
+
+        let edited =
+            move_ladder_event_in_record(&record, selected.event_index, selected.time, 1.5).unwrap();
+        let selected_id =
+            ladder_event_id_for_record(&edited, selected.juggler, selected.hand, 1.5).unwrap();
+        let edited_spec = AnimationSpec::from_record(&edited).unwrap();
+        let edited_diagram = ladder_diagram(&edited_spec).unwrap();
+        let moved = edited_diagram
+            .events
+            .iter()
+            .find(|event| event.id == selected_id)
+            .unwrap();
+
+        assert_ne!(selected_id, old_id);
+        assert!((moved.time - 1.5).abs() < 1e-9);
+        assert!(moved.transitions.is_empty());
+    }
+
+    #[test]
+    fn reordered_transition_keeps_its_semantic_selection() {
+        let record = PatternRecord::siteswap("Multiplex", "pattern=[33]");
+        let spec = AnimationSpec::from_record(&record).unwrap();
+        let diagram = ladder_diagram(&spec).unwrap();
+        let transition = diagram
+            .transitions
+            .iter()
+            .find(|transition| {
+                diagram.events.iter().any(|event| {
+                    event.event_index == transition.event_index
+                        && event.juggler == transition.juggler
+                        && event.hand == transition.hand
+                        && (event.time - transition.time).abs() < 1e-9
+                        && transition.transition_index + 1 < event.transitions.len()
+                })
+            })
+            .cloned()
+            .unwrap();
+
+        let edited = make_ladder_transition_last_in_record(
+            &record,
+            transition.event_index,
+            transition.transition_index,
+        )
+        .unwrap();
+        let selected_id = ladder_transition_id_for_record(&edited, &transition).unwrap();
+        let edited_spec = AnimationSpec::from_record(&edited).unwrap();
+        let selected = selected_ladder_transition(&edited_spec, &selected_id).unwrap();
+
+        assert_eq!(selected.path, transition.path);
+        assert!(selected.transition_index > transition.transition_index);
     }
 
     #[test]
@@ -8377,6 +8938,40 @@ mod tests {
             MhnJmlPattern::from_jml_xml(&record_to_pattern_jml(&edited).unwrap()).unwrap();
         assert_eq!(reparsed.info.as_deref(), Some("Practice notes"));
         assert_eq!(reparsed.tags, vec!["solo", "technical"]);
+    }
+
+    #[test]
+    fn pattern_view_formats_base_parameters_like_the_original_editor() {
+        assert_eq!(
+            format_base_pattern_text("pattern=3;  dwell=0.5;\nhands=(10)(32.5)"),
+            "pattern=3;\ndwell=0.5;\nhands=(10)(32.5)"
+        );
+        assert_eq!(format_base_pattern_text("pattern=3"), "pattern=3");
+    }
+
+    #[test]
+    fn pattern_view_detects_structural_edits_but_ignores_info_metadata() {
+        let record = PatternRecord::siteswap("Cascade", "pattern=3");
+        assert!(!record_base_pattern_is_edited(&record));
+
+        let xml = record_to_pattern_jml(&record).unwrap();
+        let model = MhnJmlPattern::from_jml_xml(&xml).unwrap();
+        let generated =
+            record_from_edited_jml_model(&record, model.clone(), "Edit rejected").unwrap();
+        assert!(!record_base_pattern_is_edited(&generated));
+
+        let mut metadata_only = model.clone();
+        metadata_only.info = Some("Practice notes".to_string());
+        metadata_only.tags = vec!["solo".to_string()];
+        let metadata_record =
+            record_from_edited_jml_model(&record, metadata_only, "Edit rejected").unwrap();
+        assert!(!record_base_pattern_is_edited(&metadata_record));
+
+        let mut edited = model;
+        edited.events[0].x += 1.0;
+        edited.rebuild_path_events();
+        let edited_record = record_from_edited_jml_model(&record, edited, "Edit rejected").unwrap();
+        assert!(record_base_pattern_is_edited(&edited_record));
     }
 
     #[test]

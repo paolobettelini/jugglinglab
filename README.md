@@ -35,23 +35,11 @@ See the original project for the upstream source code, history, and contributor 
 
 [jkboyce/jugglinglab](https://github.com/jkboyce/jugglinglab)
 
-## Workspace
-
-- `crates/juggling-core`: juggling-only code. JML parsing/writing, siteswap parsing, pattern library loading, animation-domain models.
-- `crates/juggling-web`: Leptos client and browser canvas renderer.
-- `crates/juggling-server`: Rust backend that serves the web app and WASM assets.
-- `public`: HTML/CSS and generated WASM package.
-
 ## Build
 
-Build the frontend WASM:
+In development mode, the assets are embedded into the executable.
 
 ```bash
-wasm-pack build crates/juggling-web --target web --out-dir ../../public/pkg
-```
-
-Start the backend:
-
-```bash
-cargo run -p juggling-server
+cargo leptos build --release
+cargo run -p juggling-server -- --address 0.0.0.0 --port 8080
 ```

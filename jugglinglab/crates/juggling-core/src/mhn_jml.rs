@@ -1029,6 +1029,48 @@ impl MhnJmlPattern {
         Ok(())
     }
 
+    pub fn move_event_image_to_time(
+        &mut self,
+        primary_index: usize,
+        image_time: f64,
+        target_time: f64,
+    ) -> Result<(), String> {
+        if !image_time.is_finite() || !target_time.is_finite() {
+            return Err("Event time must be finite".to_string());
+        }
+
+        let loop_events = self.loop_event_images()?;
+        let selected_image = loop_events
+            .iter()
+            .filter(|image| image.primary_index == primary_index)
+            .min_by(|left, right| {
+                (left.event.t - image_time)
+                    .abs()
+                    .total_cmp(&(right.event.t - image_time).abs())
+            })
+            .cloned()
+            .ok_or_else(|| "Selected event image is no longer available".to_string())?;
+        let crosses_same_hand_event = loop_events.iter().any(|image| {
+            image.event.juggler == selected_image.event.juggler
+                && image.event.hand == selected_image.event.hand
+                && (image.event.t - selected_image.event.t) * (image.event.t - target_time) < 0.0
+        });
+
+        let primary = self
+            .events
+            .get_mut(primary_index)
+            .ok_or_else(|| "Selected primary event is no longer available".to_string())?;
+        primary.t += target_time - selected_image.event.t;
+
+        if crosses_same_hand_event {
+            self.fix_holds()?;
+        }
+        self.select_primary_events()?;
+        self.sort_events();
+        self.rebuild_path_events();
+        Ok(())
+    }
+
     pub fn fix_holds(&mut self) -> Result<(), String> {
         if self.number_of_paths == 0 {
             return Ok(());
@@ -2199,6 +2241,46 @@ mod tests {
     }
 
     #[test]
+    fn moving_event_image_across_a_throw_repairs_holding_transitions() {
+        let mut pattern = MhnJmlPattern::new(1, 1, 2.0);
+        pattern.symmetries.push(delay_symmetry(1, 2.0));
+        pattern.events.push(
+            MhnJmlEvent::new(15.0, 0.0, 0.0, 0.0, 1, 0)
+                .with_transition(transition(MhnJmlTransitionType::Catch, 1)),
+        );
+        pattern.events.push(
+            MhnJmlEvent::new(20.0, 0.0, 0.0, 0.5, 1, 0)
+                .with_transition(transition(MhnJmlTransitionType::Holding, 1)),
+        );
+        pattern.events.push(
+            MhnJmlEvent::new(25.0, 0.0, 0.0, 1.0, 1, 0)
+                .with_transition(transition(MhnJmlTransitionType::Throw, 1)),
+        );
+
+        pattern.move_event_image_to_time(1, 0.5, 1.5).unwrap();
+
+        let moved_index = pattern
+            .events
+            .iter()
+            .position(|event| (event.t - 1.5).abs() < 1e-9)
+            .unwrap();
+        assert!(pattern.events[moved_index].transitions.is_empty());
+
+        pattern
+            .move_event_image_to_time(moved_index, 1.5, 0.5)
+            .unwrap();
+
+        let moved = pattern
+            .events
+            .iter()
+            .find(|event| (event.t - 0.5).abs() < 1e-9)
+            .unwrap();
+        assert!(moved.transitions.iter().any(|transition| {
+            transition.transition_type == MhnJmlTransitionType::Holding && transition.path == 1
+        }));
+    }
+
+    #[test]
     fn applies_mixed_prop_colors() {
         let mut pattern = MhnJmlPattern::new(1, 3, 1.0);
         pattern.symmetries.push(delay_symmetry(3, 1.0));
@@ -2303,6 +2385,100 @@ mod tests {
         assert!(xml.contains("<setup jugglers=\"1\" paths=\"1\" props=\"1\"/>"));
         assert!(xml.contains("hand=\"1:right\""));
         assert!(xml.contains("hand=\"1:left\""));
+    }
+
+    #[test]
+    fn canonical_jml_writer_matches_original_element_order_and_escaping() {
+        let mut pattern = MhnJmlPattern::new(2, 2, 1.25);
+        pattern.title = Some("A & B".to_string());
+        pattern.info = Some("<practice>".to_string());
+        pattern.tags = vec!["passing".to_string(), "demo&test".to_string()];
+        pattern.base_pattern_notation = Some("SiteSwap".to_string());
+        pattern.base_pattern_config = Some("pattern=<3p|3p>;  bps=2".to_string());
+        pattern
+            .props
+            .push(MhnJmlProp::new("ball", Some("color={1,2,3}".to_string())));
+        pattern.props.push(MhnJmlProp::new("ring", None));
+        pattern.prop_assignment = vec![2, 1];
+        pattern.symmetries.push(MhnJmlSymmetry {
+            symmetry_type: MhnSymmetryType::Delay,
+            number_of_jugglers: 2,
+            number_of_paths: 2,
+            juggler_perm: Permutation::identity(2),
+            path_perm: Permutation::parse(2, "(1,2)", false).unwrap(),
+            delay: 1.25,
+        });
+        pattern.symmetries.push(MhnJmlSymmetry {
+            symmetry_type: MhnSymmetryType::Switch,
+            number_of_jugglers: 2,
+            number_of_paths: 2,
+            juggler_perm: Permutation::parse(2, "(1,2)", true).unwrap(),
+            path_perm: Permutation::parse(2, "(1,2)", false).unwrap(),
+            delay: 0.0,
+        });
+        pattern.positions.push(BodyPosition {
+            x: 20.0,
+            y: 0.0,
+            z: 100.0,
+            t: 0.75,
+            angle: 90.0,
+            juggler: 2,
+        });
+        pattern.positions.push(BodyPosition {
+            x: -10.0,
+            y: 2.5,
+            z: 100.0,
+            t: 0.25,
+            angle: 45.0,
+            juggler: 1,
+        });
+        pattern.events.push(
+            MhnJmlEvent::new(-12.5, 0.0, 5.0, 0.75, 2, 1)
+                .with_transition(transition(MhnJmlTransitionType::SoftCatch, 1))
+                .with_transition(transition(MhnJmlTransitionType::Holding, 2)),
+        );
+        pattern.events.push(
+            MhnJmlEvent::new(12.5, 0.0, 5.0, 0.25, 1, 0)
+                .with_transition(MhnJmlTransition {
+                    transition_type: MhnJmlTransitionType::Throw,
+                    path: 1,
+                    throw_type: Some("bounce".to_string()),
+                    throw_mod: Some("bounces=2&forced=true".to_string()),
+                })
+                .with_transition(transition(MhnJmlTransitionType::GrabCatch, 2)),
+        );
+
+        assert_eq!(
+            pattern.write_jml(true, true),
+            r#"<?xml version="1.0"?>
+<!DOCTYPE jml SYSTEM "file://jml.dtd">
+<jml version="3">
+<pattern>
+<title>A &amp; B</title>
+<info tags="passing,demo&amp;test">&lt;practice&gt;</info>
+<basepattern notation="siteswap">
+pattern=&lt;3p|3p&gt;;
+bps=2
+</basepattern>
+<prop type="ball" mod="color={1,2,3}"/>
+<prop type="ring"/>
+<setup jugglers="2" paths="2" props="2,1"/>
+<symmetry type="delay" pperm="(1,2)" delay="1.25"/>
+<symmetry type="switch" jperm="(1,2)" pperm="(1,2)"/>
+<position x="-10" y="2.5" z="100" t="0.25" angle="45" juggler="1"/>
+<position x="20" y="0" z="100" t="0.75" angle="90" juggler="2"/>
+<event x="12.5" y="0" z="5" t="0.25" hand="1:right">
+<throw path="1" type="bounce" mod="bounces=2&amp;forced=true"/>
+<catch path="2" type="grab"/>
+</event>
+<event x="-12.5" y="0" z="5" t="0.75" hand="2:left">
+<catch path="1" type="soft"/>
+<holding path="2"/>
+</event>
+</pattern>
+</jml>
+"#
+        );
     }
 
     #[test]

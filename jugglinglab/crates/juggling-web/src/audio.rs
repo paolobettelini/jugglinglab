@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use web_sys::HtmlAudioElement;
 
 const CLIP_POOL_SIZE: usize = 16;
-const CATCH_SOUND_SOURCE: &str = "/assets/sounds/catch.wav";
-const BOUNCE_SOUND_SOURCE: &str = "/assets/sounds/bounce.wav";
+const CATCH_SOUND_SOURCE: &str = "assets/sounds/catch.wav";
+const BOUNCE_SOUND_SOURCE: &str = "assets/sounds/bounce.wav";
 
 struct AudioPool {
     clips: Vec<HtmlAudioElement>,

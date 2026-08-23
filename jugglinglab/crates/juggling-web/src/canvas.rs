@@ -38,6 +38,8 @@ pub struct RenderSettings {
 pub struct EventSelection {
     pub primary_index: usize,
     pub time: f64,
+    pub juggler: usize,
+    pub hand: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub enum EventEditHandle {
 pub struct EventEditorHit {
     pub primary_index: usize,
     pub event_time: f64,
+    pub image_juggler: usize,
     pub image_hand: usize,
     pub handle: EventEditHandle,
     pub local_x_dx: f64,
@@ -244,6 +247,7 @@ enum RenderObjectKind {
     },
     Line {
         juggler: usize,
+        body_depth_delta: Option<f64>,
     },
     Trail {
         alpha: f64,
@@ -587,7 +591,33 @@ impl RenderObject {
             .map(|point| camera.project(point))
             .collect::<Vec<_>>();
         Self {
-            kind: RenderObjectKind::Line { juggler },
+            kind: RenderObjectKind::Line {
+                juggler,
+                body_depth_delta: None,
+            },
+            bounds: Bounds::from_points(&coords, 4.0),
+            coords,
+            covering: Vec::new(),
+        }
+    }
+
+    fn arm_line(
+        juggler: usize,
+        start: Coordinate,
+        end: Coordinate,
+        body: &RenderObject,
+        camera: &RenderCamera,
+    ) -> Self {
+        let coords = [start, end]
+            .into_iter()
+            .map(point_from_coordinate)
+            .map(|point| camera.project(point))
+            .collect::<Vec<_>>();
+        Self {
+            kind: RenderObjectKind::Line {
+                juggler,
+                body_depth_delta: arm_segment_body_depth_delta(body, &coords),
+            },
             bounds: Bounds::from_points(&coords, 4.0),
             coords,
             covering: Vec::new(),
@@ -1373,6 +1403,8 @@ fn draw_event_editor(
             EventSelection {
                 primary_index: event.primary_index,
                 time: event.event.t,
+                juggler: event.event.juggler,
+                hand: event.event.hand,
             },
             axis_x,
             axis_y,
@@ -1387,6 +1419,7 @@ fn draw_event_editor(
                 hit: EventEditorHit {
                     primary_index: event.primary_index,
                     event_time: event.event.t,
+                    image_juggler: event.event.juggler,
                     image_hand: event.event.hand,
                     handle: EventEditHandle::Xz,
                     local_x_dx: drag_axes.x.0,
@@ -1415,6 +1448,7 @@ fn draw_event_editor(
     let geometry = EventEditorHit {
         primary_index: selection.primary_index,
         event_time: selected.event.t,
+        image_juggler: selected.event.juggler,
         image_hand: selected.event.hand,
         handle: EventEditHandle::Xz,
         local_x_dx: drag_axes.x.0,
@@ -1485,7 +1519,11 @@ fn selected_layout_event_index(
         .events
         .iter()
         .enumerate()
-        .filter(|(_, event)| event.primary_index == selection.primary_index)
+        .filter(|(_, event)| {
+            event.primary_index == selection.primary_index
+                && event.event.juggler == selection.juggler
+                && event.event.hand == selection.hand
+        })
         .min_by(|(_, left), (_, right)| {
             cyclic_time_distance(left.event.t, selection.time, period_secs)
                 .total_cmp(&cyclic_time_distance(
@@ -2164,23 +2202,28 @@ fn push_juggler_render_objects(
     juggler: usize,
     camera: &RenderCamera,
 ) {
-    objects.push(RenderObject::body(frame, juggler, camera));
+    let body = RenderObject::body(frame, juggler, camera);
+    let mut arms = Vec::with_capacity(6);
     push_arm_render_objects(
-        objects,
+        &mut arms,
         juggler,
         frame.left_shoulder,
         frame.left_elbow,
         frame.left_hand,
+        &body,
         camera,
     );
     push_arm_render_objects(
-        objects,
+        &mut arms,
         juggler,
         frame.right_shoulder,
         frame.right_elbow,
         frame.right_hand,
+        &body,
         camera,
     );
+    objects.push(body);
+    objects.extend(arms);
 }
 
 fn push_arm_render_objects(
@@ -2189,13 +2232,43 @@ fn push_arm_render_objects(
     shoulder: Coordinate,
     elbow: Option<Coordinate>,
     hand: Coordinate,
+    body: &RenderObject,
     camera: &RenderCamera,
 ) {
     if let Some(elbow) = elbow {
-        objects.push(RenderObject::line(juggler, shoulder, elbow, camera));
-        objects.push(RenderObject::line(juggler, elbow, hand, camera));
+        push_arm_segment_render_objects(objects, juggler, shoulder, elbow, body, camera);
+        push_arm_segment_render_objects(objects, juggler, elbow, hand, body, camera);
     } else {
-        objects.push(RenderObject::line(juggler, shoulder, hand, camera));
+        push_arm_segment_render_objects(objects, juggler, shoulder, hand, body, camera);
+    }
+}
+
+fn push_arm_segment_render_objects(
+    objects: &mut Vec<RenderObject>,
+    juggler: usize,
+    start: Coordinate,
+    end: Coordinate,
+    body: &RenderObject,
+    camera: &RenderCamera,
+) {
+    let start_screen = camera.project(point_from_coordinate(start));
+    let end_screen = camera.project(point_from_coordinate(end));
+    if let Some(t) = arm_plane_crossing_parameter(body, start_screen, end_screen) {
+        let crossing = interpolate_coordinate(start, end, t);
+        objects.push(RenderObject::arm_line(
+            juggler, start, crossing, body, camera,
+        ));
+        objects.push(RenderObject::arm_line(juggler, crossing, end, body, camera));
+    } else {
+        objects.push(RenderObject::arm_line(juggler, start, end, body, camera));
+    }
+}
+
+fn interpolate_coordinate(start: Coordinate, end: Coordinate, t: f64) -> Coordinate {
+    Coordinate {
+        x: start.x + (end.x - start.x) * t,
+        y: start.y + (end.y - start.y) * t,
+        z: start.z + (end.z - start.z) * t,
     }
 }
 
@@ -2330,7 +2403,7 @@ fn draw_render_object(ctx: &CanvasRenderingContext2d, object: &RenderObject, pal
                 object.bounds.bottom,
             );
         }
-        RenderObjectKind::Line { juggler } => {
+        RenderObjectKind::Line { juggler, .. } => {
             draw_line_object(ctx, &object.coords, *juggler, palette);
             if *juggler > 0 && object.coords.len() >= 2 {
                 push_segment_hit(
@@ -2698,7 +2771,7 @@ fn draw_body_object(ctx: &CanvasRenderingContext2d, coords: &[ScreenPoint], pale
     ctx.set_stroke_style_str(palette.figure);
     ctx.set_fill_style_str(palette.background_alt);
     ctx.set_line_width(2.4);
-    ctx.set_global_alpha(0.92);
+    ctx.set_global_alpha(1.0);
 
     ctx.begin_path();
     ctx.move_to(coords[0].x, coords[0].y);
@@ -3236,6 +3309,68 @@ fn depth_on_plane(origin: ScreenPoint, normal: ScreenPoint, x: f64, y: f64) -> O
     Some(origin.z - (normal.x * (x - origin.x) + normal.y * (y - origin.y)) / normal.z)
 }
 
+fn arm_body_depth_delta(body: &RenderObject, point: ScreenPoint) -> Option<f64> {
+    let normal = box_plane_normal(body)?;
+    let normal_length = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z).sqrt();
+    if normal_length <= f64::EPSILON {
+        return None;
+    }
+
+    // A nearly edge-on torso has no stable screen-space plane depth. Its mean
+    // camera depth still gives the correct near/far side for the narrow overlap.
+    if normal.z.abs() <= normal_length * 1.0e-6 {
+        let torso_len = body.coords.len().min(4);
+        if torso_len == 0 {
+            return None;
+        }
+        let body_depth = body
+            .coords
+            .iter()
+            .take(torso_len)
+            .map(|coord| coord.z)
+            .sum::<f64>()
+            / torso_len as f64;
+        return Some(point.z - body_depth);
+    }
+
+    depth_on_plane(body.coords[0], normal, point.x, point.y).map(|body_depth| point.z - body_depth)
+}
+
+fn arm_segment_body_depth_delta(body: &RenderObject, coords: &[ScreenPoint]) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0;
+    for point in coords {
+        if let Some(delta) = arm_body_depth_delta(body, *point) {
+            sum += delta;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(sum / count as f64)
+    }
+}
+
+fn arm_plane_crossing_parameter(
+    body: &RenderObject,
+    start: ScreenPoint,
+    end: ScreenPoint,
+) -> Option<f64> {
+    let start_delta = arm_body_depth_delta(body, start)?;
+    let end_delta = arm_body_depth_delta(body, end)?;
+    if !start_delta.is_finite()
+        || !end_delta.is_finite()
+        || start_delta == 0.0
+        || end_delta == 0.0
+        || start_delta.is_sign_positive() == end_delta.is_sign_positive()
+    {
+        return None;
+    }
+    let t = start_delta / (start_delta - end_delta);
+    (t > 1.0e-6 && t < 1.0 - 1.0e-6).then_some(t)
+}
+
 fn box_covering_line(box_object: &RenderObject, line_object: &RenderObject) -> i32 {
     if !matches!(
         box_object.kind,
@@ -3246,6 +3381,27 @@ fn box_covering_line(box_object: &RenderObject, line_object: &RenderObject) -> i
     ) || line_object.coords.len() < 2
     {
         return 0;
+    }
+
+    if let (
+        RenderObjectKind::Body {
+            juggler: body_juggler,
+        },
+        RenderObjectKind::Line {
+            juggler: line_juggler,
+            body_depth_delta: Some(depth_delta),
+        },
+    ) = (&box_object.kind, &line_object.kind)
+    {
+        if body_juggler == line_juggler && *body_juggler > 0 {
+            return if *depth_delta < 0.0 {
+                -1
+            } else if *depth_delta > 0.0 {
+                1
+            } else {
+                0
+            };
+        }
     }
 
     let Some(normal) = box_plane_normal(box_object) else {
@@ -3292,7 +3448,7 @@ fn box_covering_line(box_object: &RenderObject, line_object: &RenderObject) -> i
         let Some(box_depth) = depth_on_plane(box_object.coords[0], normal, x, y) else {
             return 0;
         };
-        let line_depth = line0.z + (line1.z - line0.z) * (y - line0.y) / (line1.y - line0.y);
+        let line_depth = line0.z + (line1.z - line0.z) * (x - line0.x) / (line1.x - line0.x);
         if line_depth < box_depth - SLOP {
             return -1;
         }
@@ -3313,7 +3469,7 @@ fn box_covering_line(box_object: &RenderObject, line_object: &RenderObject) -> i
         let Some(box_depth) = depth_on_plane(box_object.coords[0], normal, x, y) else {
             return 0;
         };
-        let line_depth = line0.z + (line1.z - line0.z) * (x - line0.x) / (line1.x - line0.x);
+        let line_depth = line0.z + (line1.z - line0.z) * (y - line0.y) / (line1.y - line0.y);
         if line_depth < box_depth - SLOP {
             return -1;
         }
@@ -3397,6 +3553,167 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_screen_point(x: f64, y: f64, z: f64) -> ScreenPoint {
+        ScreenPoint {
+            x,
+            y,
+            z,
+            perspective: 1.0,
+        }
+    }
+
+    fn test_coordinate(x: f64, y: f64, z: f64) -> Coordinate {
+        Coordinate { x, y, z }
+    }
+
+    fn test_juggler_frame() -> JugglerFrame {
+        JugglerFrame {
+            left_hand: test_coordinate(-16.0, -10.0, 8.0),
+            right_hand: test_coordinate(16.0, -10.0, 8.0),
+            left_shoulder: test_coordinate(-10.0, 0.0, 10.0),
+            right_shoulder: test_coordinate(10.0, 0.0, 10.0),
+            left_elbow: None,
+            right_elbow: None,
+            left_waist: test_coordinate(-5.0, 0.0, 0.0),
+            right_waist: test_coordinate(5.0, 0.0, 0.0),
+            left_head_bottom: test_coordinate(-4.0, 0.0, 12.0),
+            left_head_top: test_coordinate(-4.0, 0.0, 20.0),
+            right_head_bottom: test_coordinate(4.0, 0.0, 12.0),
+            right_head_top: test_coordinate(4.0, 0.0, 20.0),
+        }
+    }
+
+    fn test_camera(matrix: Matrix4) -> RenderCamera {
+        RenderCamera {
+            zoom: 1.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            matrix,
+        }
+    }
+
+    fn test_body_box() -> RenderObject {
+        RenderObject {
+            kind: RenderObjectKind::Body { juggler: 1 },
+            coords: vec![
+                test_screen_point(0.0, 0.0, 0.0),
+                test_screen_point(10.0, 0.0, 0.0),
+                test_screen_point(10.0, 10.0, 0.0),
+            ],
+            bounds: Bounds {
+                left: 0.0,
+                top: 0.0,
+                right: 10.0,
+                bottom: 10.0,
+            },
+            covering: Vec::new(),
+        }
+    }
+
+    fn test_arm(start: ScreenPoint, end: ScreenPoint) -> RenderObject {
+        RenderObject {
+            kind: RenderObjectKind::Line {
+                juggler: 1,
+                body_depth_delta: None,
+            },
+            coords: vec![start, end],
+            bounds: Bounds::from_points(&[start, end], 0.0),
+            covering: Vec::new(),
+        }
+    }
+
+    fn test_owned_arm(start: ScreenPoint, end: ScreenPoint, body_depth_delta: f64) -> RenderObject {
+        RenderObject {
+            kind: RenderObjectKind::Line {
+                juggler: 1,
+                body_depth_delta: Some(body_depth_delta),
+            },
+            coords: vec![start, end],
+            bounds: Bounds::from_points(&[start, end], 0.0),
+            covering: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn axis_aligned_arms_keep_their_depth_against_the_body() {
+        let body = test_body_box();
+        let horizontal = test_arm(
+            test_screen_point(-5.0, 5.0, -10.0),
+            test_screen_point(15.0, 5.0, -10.0),
+        );
+        let vertical = test_arm(
+            test_screen_point(5.0, -5.0, -10.0),
+            test_screen_point(5.0, 15.0, -10.0),
+        );
+
+        assert_eq!(box_covering_line(&body, &horizontal), -1);
+        assert_eq!(box_covering_line(&body, &vertical), -1);
+        assert!(horizontal.is_covering(&body));
+        assert!(vertical.is_covering(&body));
+    }
+
+    #[test]
+    fn own_arm_depth_does_not_inherit_the_coplanar_shoulder_order() {
+        let body = test_body_box();
+        let shoulder = test_screen_point(0.0, 5.0, 0.0);
+        let front_arm = test_owned_arm(shoulder, test_screen_point(15.0, 5.0, -10.0), -5.0);
+        let back_arm = test_owned_arm(shoulder, test_screen_point(15.0, 5.0, 10.0), 5.0);
+
+        assert_eq!(box_covering_line(&body, &front_arm), -1);
+        assert!(front_arm.is_covering(&body));
+        assert_eq!(box_covering_line(&body, &back_arm), 1);
+        assert!(body.is_covering(&back_arm));
+    }
+
+    #[test]
+    fn arm_is_split_where_it_crosses_the_torso_plane() {
+        let body = test_body_box();
+        let start = test_screen_point(5.0, 5.0, -10.0);
+        let end = test_screen_point(5.0, 5.0, 10.0);
+
+        let crossing = arm_plane_crossing_parameter(&body, start, end).unwrap();
+        assert!((crossing - 0.5).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn rotating_behind_the_juggler_reverses_the_complete_arm_body_order() {
+        let frame = test_juggler_frame();
+        let front_camera = test_camera(Matrix4::identity());
+        let back_camera = test_camera(Matrix4::rotate(0.0, std::f64::consts::PI, 0.0));
+
+        for (camera, arms_should_cover_body) in [(front_camera, true), (back_camera, false)] {
+            let mut objects = Vec::new();
+            push_juggler_render_objects(&mut objects, &frame, 1, &camera);
+            let order = sorted_render_order(&mut objects);
+            let body_index = objects
+                .iter()
+                .position(|object| matches!(object.kind, RenderObjectKind::Body { .. }))
+                .unwrap();
+            let body_order = order.iter().position(|index| *index == body_index).unwrap();
+            let arm_orders = objects
+                .iter()
+                .enumerate()
+                .filter(|(_, object)| {
+                    matches!(
+                        object.kind,
+                        RenderObjectKind::Line {
+                            juggler: 1,
+                            body_depth_delta: Some(_)
+                        }
+                    )
+                })
+                .map(|(index, _)| order.iter().position(|ordered| *ordered == index).unwrap())
+                .collect::<Vec<_>>();
+
+            assert!(!arm_orders.is_empty());
+            if arms_should_cover_body {
+                assert!(arm_orders.iter().all(|arm_order| *arm_order > body_order));
+            } else {
+                assert!(arm_orders.iter().all(|arm_order| *arm_order < body_order));
+            }
+        }
+    }
 
     #[test]
     fn prop_metrics_use_original_integer_centers_and_grips() {
